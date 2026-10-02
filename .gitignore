@@ -1,0 +1,9 @@
+# 构建产物
+/target
+
+# 运行时生成
+config.json
+
+# 临时诊断/截图
+*.log
+*.bmp
