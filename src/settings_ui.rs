@@ -37,6 +37,7 @@ const CLASS_NAME: &str = "RingDockSettings";
 // 控件 ID
 const ID_SWITCH: i32 = 1001;
 const ID_AUTOCLOSE: i32 = 1002;
+const ID_AUTOSTART: i32 = 1005;
 const ID_ICON_STYLE: i32 = 1003;
 const ID_CATEGORY_MODE: i32 = 1004;
 const ID_CATEGORY_ICON_BASE: i32 = 1100;
@@ -54,6 +55,7 @@ pub fn open_settings(
     main_hwnd: HWND,
     switch_on_click: bool,
     auto_collapse: bool,
+    auto_start: bool,
     icon_style: IconStyle,
     category_display_mode: CategoryDisplayMode,
     quadrants: &[Quadrant],
@@ -75,7 +77,7 @@ pub fn open_settings(
         // 居中于主屏工作区
         let (x, y, aw, ah) = deskpin::work_area();
         let row_count = quadrants.len().clamp(2, 8);
-        let (ww, hh) = (640, 606 + row_count as i32 * 34);
+        let (ww, hh) = (640, 644 + row_count as i32 * 34);
         let wx = x + ((aw - ww) / 2).max(0);
         let wy = y + ((ah - hh) / 2).max(0);
 
@@ -108,6 +110,7 @@ pub fn open_settings(
             hwnd,
             switch_on_click,
             auto_collapse,
+            auto_start,
             icon_style,
             category_display_mode,
             quadrants,
@@ -193,6 +196,7 @@ unsafe fn create_controls(
     parent: HWND,
     switch_on_click: bool,
     auto_collapse: bool,
+    auto_start: bool,
     icon_style: IconStyle,
     category_display_mode: CategoryDisplayMode,
     quadrants: &[Quadrant],
@@ -273,8 +277,18 @@ unsafe fn create_controls(
         28,
         ID_AUTOCLOSE,
     );
-    make("STATIC", "02   外观与分类", base, 32, 244, 560, 24, 0);
-    make("STATIC", "条目图标", base, 36, 288, 140, 24, 0);
+    make(
+        "BUTTON",
+        "登录 Windows 时自动启动 Ring Dock",
+        base | BS_AUTOCHECKBOX as u32,
+        36,
+        226,
+        550,
+        28,
+        ID_AUTOSTART,
+    );
+    make("STATIC", "02   外观与分类", base, 32, 282, 560, 24, 0);
+    make("STATIC", "条目图标", base, 36, 326, 140, 24, 0);
     let combo_cls = wide("COMBOBOX");
     let combo = CreateWindowExW(
         WINDOW_EX_STYLE(0),
@@ -282,7 +296,7 @@ unsafe fn create_controls(
         PCWSTR::null(),
         WINDOW_STYLE(base | CBS_DROPDOWNLIST as u32),
         190,
-        282,
+        320,
         398,
         120,
         Some(parent),
@@ -315,7 +329,7 @@ unsafe fn create_controls(
         Some(WPARAM(font.0 as usize)),
         Some(LPARAM(1)),
     );
-    make("STATIC", "圆环显示", base, 36, 330, 140, 24, 0);
+    make("STATIC", "圆环显示", base, 36, 368, 140, 24, 0);
     let mode_cls = wide("COMBOBOX");
     let mode_combo = CreateWindowExW(
         WINDOW_EX_STYLE(0),
@@ -323,7 +337,7 @@ unsafe fn create_controls(
         PCWSTR::null(),
         WINDOW_STYLE(base | CBS_DROPDOWNLIST as u32),
         190,
-        324,
+        362,
         398,
         120,
         Some(parent),
@@ -361,7 +375,7 @@ unsafe fn create_controls(
         Some(LPARAM(1)),
     );
 
-    make("STATIC", "分类图标", base, 36, 372, 140, 24, 0);
+    make("STATIC", "分类图标", base, 36, 410, 140, 24, 0);
     const CATEGORY_ICONS: [(&str, &str); 9] = [
         ("auto", "自动（按分类名称）"),
         ("collaboration", "对话气泡"),
@@ -374,7 +388,7 @@ unsafe fn create_controls(
         ("url", "网址"),
     ];
     for (index, quadrant) in quadrants.iter().take(8).enumerate() {
-        let y = 408 + index as i32 * 34;
+        let y = 446 + index as i32 * 34;
         make("STATIC", &quadrant.label, base, 36, y + 3, 144, 20, 0);
         let icon_cls = wide("COMBOBOX");
         let icon_combo = CreateWindowExW(
@@ -422,7 +436,7 @@ unsafe fn create_controls(
         );
     }
 
-    let weather_y = 430 + quadrants.len().clamp(2, 8) as i32 * 34;
+    let weather_y = 468 + quadrants.len().clamp(2, 8) as i32 * 34;
     make(
         "BUTTON",
         "定位并更新天气",
@@ -486,18 +500,30 @@ unsafe fn create_controls(
         },
     )
     .ok();
+    CheckDlgButton(
+        parent,
+        ID_AUTOSTART,
+        if auto_start {
+            BST_CHECKED
+        } else {
+            BST_UNCHECKED
+        },
+    )
+    .ok();
 }
 
 /// 读勾选 → 落盘 config.json → 通知主窗口重载
 unsafe fn save(hwnd: HWND) {
     let switch_on_click = IsDlgButtonChecked(hwnd, ID_SWITCH) != 0;
     let auto_collapse_after_open = IsDlgButtonChecked(hwnd, ID_AUTOCLOSE) != 0;
+    let auto_start = IsDlgButtonChecked(hwnd, ID_AUTOSTART) != 0;
     let (mut cfg, note) = Config::load();
     if !note.is_empty() {
         eprintln!("[ring-dock] {note}");
     }
     cfg.switch_panel_on_click = switch_on_click;
     cfg.auto_collapse_after_open = auto_collapse_after_open;
+    cfg.auto_start = auto_start;
     let display_mode = SendMessageW(
         GetDlgItem(Some(hwnd), ID_CATEGORY_MODE).unwrap_or_default(),
         CB_GETCURSEL,
@@ -571,7 +597,7 @@ unsafe extern "system" fn settings_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPAR
             let _ = GetClientRect(hwnd, &mut rect);
             FillRect(dc, &rect, HBRUSH(BG_BRUSH.load(Ordering::SeqCst) as *mut _));
             let brush = CreateSolidBrush(COLORREF(0x0041362b));
-            for y in [96, 228, rect.bottom - 68] {
+            for y in [96, 266, rect.bottom - 68] {
                 FillRect(
                     dc,
                     &RECT {

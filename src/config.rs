@@ -57,6 +57,9 @@ pub struct Config {
     /// 打开条目后自动收起面板
     #[serde(default = "default_true")]
     pub auto_collapse_after_open: bool,
+    /// 登录 Windows 后自动启动；旧配置默认关闭。
+    #[serde(default)]
+    pub auto_start: bool,
     /// 圆环中心在主屏工作区中的比例；旧配置缺省为居中偏上。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dock_position: Option<DockPosition>,
@@ -122,6 +125,7 @@ impl Default for Config {
             max_height_ratio: 0.72,
             switch_panel_on_click: true,
             auto_collapse_after_open: true,
+            auto_start: false,
             dock_position: None,
             win_memory_cleaner_path: None,
             quadrants: vec![

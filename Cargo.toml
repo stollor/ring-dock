@@ -3,7 +3,7 @@ members = [".", "crates/deskpin"]
 
 [package]
 name = "ring-dock"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Windows 桌面圆环收纳工具 —— 半透明圆环象限收纳桌面图标，逐像素透明玻璃界面"
 
@@ -38,6 +38,7 @@ features = [
     "Win32_System_WinRT",
     "Win32_Networking_WinHttp",
     "Win32_System_SystemServices",
+    "Win32_System_Registry",
     "Win32_System_LibraryLoader",
     "Win32_UI_HiDpi",
     "Win32_UI_WindowsAndMessaging",

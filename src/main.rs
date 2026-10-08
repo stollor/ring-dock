@@ -1,6 +1,7 @@
 //! Desktop Orbit Glass. True per-pixel alpha; no captured wallpaper or text regions.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod autostart;
 mod cleanup;
 mod config;
 mod drop;
@@ -756,6 +757,9 @@ impl App {
             eprintln!("[ring-dock] {note}");
         }
         self.cfg = cfg;
+        if let Err(error) = crate::autostart::apply(self.cfg.auto_start) {
+            self.status = Some((format!("开机启动设置失败：{error}"), Instant::now()));
+        }
         self.geom.n = self.cfg.quadrant_count;
         self.restore_position();
         self.set_expanded(None);
@@ -795,6 +799,7 @@ impl App {
             self.hwnd,
             self.cfg.switch_panel_on_click,
             self.cfg.auto_collapse_after_open,
+            self.cfg.auto_start,
             self.cfg.icon_style,
             self.cfg.category_display_mode,
             &self.cfg.quadrants,
@@ -1306,8 +1311,12 @@ fn main() {
     if !note.is_empty() {
         eprintln!("[ring-dock] {note}");
     }
-
     let preview = std::env::args().any(|arg| arg == "--preview");
+    if !preview {
+        if let Err(error) = crate::autostart::apply(cfg.auto_start) {
+            eprintln!("[ring-dock] 开机启动设置失败：{error}");
+        }
+    }
     let broker_result = if preview {
         Ok(None)
     } else {
