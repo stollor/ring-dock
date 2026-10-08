@@ -1,20 +1,51 @@
 # AI 安装与图标整理提示词
 
-将下面的提示词交给能操作 Windows 桌面、浏览器和文件的 AI 助手。运行涉及管理员权限的操作前，请让 AI 说明用途并等待用户同意。
+将以下提示词复制给能操作本机 Windows、PowerShell 和桌面的 AI 助手。它会下载安装 Ring Dock、创建使用内嵌圆环图标的桌面快捷方式，并自动收纳桌面快捷方式；桌面上的普通文件和文件夹可由 AI 通过界面拖入收藏。涉及 UAC 时，AI 必须先说明原因并等待你操作。
 
-```text
-请帮我安装并整理 Ring Dock。项目官方仓库是 https://github.com/stollor/ring-dock 。请按下面步骤操作，并在每一步向我说明结果：
+````text
+请在我的 Windows 电脑上安装 Ring Dock，并把桌面图标收纳到圆环分类里。请实际操作浏览器、PowerShell 和 Windows 桌面，不要只给我步骤。项目官方仓库是 https://github.com/stollor/ring-dock 。
 
-1. 只从官方仓库的 Releases 页面 https://github.com/stollor/ring-dock/releases/latest 下载最新的 ring-dock-v...-windows-x64.zip。不要下载源码压缩包，也不要从第三方站点下载 exe。若没有可用 Release 或找不到该 ZIP，停止并告诉我，不要自行编译或找镜像。
-2. 下载后先检查 Release 页面是否提供 SHA-256 文件；有的话，核对 ZIP 哈希，不一致就停止。将程序解压到我有写入权限的位置，默认使用 %LOCALAPPDATA%\Programs\RingDock。如果这个目录已有 config.json，请先备份它，升级时保留我的收藏与设置，不要覆盖。
-3. 启动 ring-dock.exe。程序如请求管理员权限，先告诉我这是为了启动可选的 WinMemoryCleaner 内存整理助手，并等待我决定；不要代替我点击 UAC。拒绝后继续确认圆环本身是否能运行。
-4. 在桌面为 ring-dock.exe 创建一个快捷方式（如果已有，就更新而不重复创建）。把快捷方式图标设置为 ring-dock.exe 内嵌的应用图标，IconLocation 使用该 exe 路径与图标索引 0。不要从网上另找图标，也不要覆盖 Windows 系统图标。
-5. 如果我要求整理圆环内的收藏，先询问我希望使用哪些分类、加入哪些项目。只整理我明确指定的应用、文件、文件夹或网址；不要扫描桌面或磁盘、不要猜测私人项目。可以建议“日常协作、开发创作、AI 助手、娱乐影音”等分类，但先让我确认。
-6. 按我确认的分类，把指定的原文件或快捷方式拖入圆环对应分类展开后的面板。保留源文件原位，不移动、不删除、不重命名。不要把个人 config.json 上传或粘贴到聊天里。
-7. 右键圆环打开“设置”，按我确认的偏好选择圆环分类图标显示方式（图标、弧形文字或两者），并为每个分类设置匹配图标。需要时，将面板条目图标样式设为“Windows 原图标”或“低饱和图标”。保存后让我看到圆环和展开面板，确认每个图标都能辨认。
-8. 最后告诉我安装目录、桌面快捷方式位置、选用的分类和图标、config.json 位置，以及我可以怎样卸载。卸载前先退出程序并询问我是否保留 config.json；不要删除我收藏的原始文件。
+1. 从 https://github.com/stollor/ring-dock/releases/latest 下载最新的 `ring-dock-v...-windows-x64.zip` 和同一 Release 的 `SHA256SUMS.txt`。不要下载源码包或第三方 exe。用 `Get-FileHash -Algorithm SHA256` 核对 ZIP；校验不一致或没有该文件时停止。
+2. 解压到 `%LOCALAPPDATA%\Programs\RingDock`。如果目录已有 `config.json`，保留它和原收藏，不要用默认配置覆盖。启动 `ring-dock.exe` 一次，并等到同目录的 `config.json` 存在。
+3. 如果启动时出现 UAC，先向我说明这是为了运行可选的 WinMemoryCleaner 内存整理助手，并等待我自己决定；不要替我点击 UAC。拒绝后继续使用圆环。
+4. 在桌面创建或更新 `ring-dock.exe` 的快捷方式，图标位置设为该 exe 路径、索引 0，使用程序内嵌的圆环图标。不要从网上另找图标，不要重复创建快捷方式。
+5. 用下面命令下载与当前 Release 标签完全匹配的官方桌面导入脚本。把 `$installDir` 改成实际安装目录；先做只读预览，再自动导入。导入脚本递归扫描当前用户桌面和公共桌面的 `.lnk`、`.url`、`.website`、`.appref-ms` 快捷方式，按来源文件夹或目标类型分类，跳过已收藏路径；它不会执行快捷方式、移动/删除源文件或上传配置。正式导入前会在配置旁创建备份。
+
+```powershell
+$installDir = Join-Path $env:LOCALAPPDATA 'Programs\RingDock'
+$configPath = Join-Path $installDir 'config.json'
+$release = Invoke-RestMethod -Uri 'https://api.github.com/repos/stollor/ring-dock/releases/latest'
+$scriptPath = Join-Path $env:TEMP ("ring-dock-import-" + $release.tag_name + '.ps1')
+$scriptUrl = "https://raw.githubusercontent.com/stollor/ring-dock/$($release.tag_name)/tools/orbit/import_desktop.ps1"
+$reportPath = Join-Path $env:TEMP ("ring-dock-import-" + [guid]::NewGuid().ToString('N') + '.json')
+Invoke-WebRequest -Uri $scriptUrl -OutFile $scriptPath
+
+try {
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File $scriptPath -ConfigPath $configPath -ScanOnly -ReportPath $reportPath | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw '桌面快捷方式预览失败，停止导入。' }
+    $preview = Get-Content -LiteralPath $reportPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    $preview | Select-Object discovered, added, duplicates
+    $preview.items | Group-Object category | Select-Object Name, Count
+
+    if ($preview.discovered -gt 0) {
+        powershell.exe -NoProfile -ExecutionPolicy Bypass -File $scriptPath -ConfigPath $configPath -ReportPath $reportPath | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw '桌面快捷方式导入失败，请保留现有配置。' }
+        $result = Get-Content -LiteralPath $reportPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        $result | Select-Object added, duplicates, backup
+    }
+} finally {
+    Remove-Item -LiteralPath $reportPath -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $scriptPath -Force -ErrorAction SilentlyContinue
+}
 ```
 
-## 给项目维护者
+6. 导入脚本只处理快捷方式。把桌面根目录中未被导入的普通文件和文件夹，通过文件资源管理器拖到圆环对应分类的展开面板里收藏；跳过回收站、“此电脑”和用于分类的文件夹本身。只添加桌面上的项目，不继续扫描其他磁盘。拖入只收藏路径，不移动或删除原件。
+7. 右键圆环打开“设置”，按我的桌面内容选择分类图标和圆环显示方式。不要运行或逐个打开桌面项目。不要把完整路径、导入报告或 `config.json` 内容贴到聊天里。
+8. 最后告诉我安装目录、快捷方式位置、导入数量和分类数量、配置备份位置，以及卸载方法。不要删除我的源文件；卸载时先询问我是否保留 `config.json`。
+````
 
-Release 工作流生成 `SHA256SUMS.txt`。后续如改变发布资产命名，请同步更新提示词里的 ZIP 文件名规则。
+## 导入行为
+
+导入器只检查当前用户桌面和公共桌面。它不会继续扫描其他磁盘。识别到的链接先按来源子目录分类：工具效率/通讯社交放入“日常协作”，开发编程/设计引擎放入“开发创作”，AI应用放入“AI助手”，游戏影音放入“娱乐影音”；其余条目按程序、文件夹、文件或网址类型匹配现有分类。桌面根目录中的普通文件和文件夹通过拖放收藏。
+
+Release 工作流会生成 `SHA256SUMS.txt`。导入脚本从与下载包相同的 Release 标签读取，避免误用其他版本。

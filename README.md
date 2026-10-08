@@ -12,7 +12,53 @@
 2. 将压缩包解压到你有写入权限的文件夹，例如 `%LOCALAPPDATA%\Programs\RingDock`。
 3. 双击 `ring-dock.exe`。程序会把设置保存在 exe 同目录的 `config.json`。
 
-程序自带圆环应用图标。想放到桌面时，右键 `ring-dock.exe` 创建快捷方式；快捷方式会使用 exe 内嵌图标。也可以让 AI 按你的习惯安装并整理图标：[打开 AI 安装与图标整理提示词](docs/AI安装与图标整理提示词.md)。
+程序自带圆环应用图标。想放到桌面时，右键 `ring-dock.exe` 创建快捷方式；快捷方式会使用 exe 内嵌图标。
+
+### 使用 AI 安装并整理桌面图标
+
+复制下面的提示词，交给能操作本机 Windows、PowerShell 和桌面的 AI 助手。提示词会让 AI 下载正式版、创建带圆环图标的桌面快捷方式，并把桌面快捷方式自动收纳到分类面板。完整说明也可看[单独的提示词文档](docs/AI安装与图标整理提示词.md)。
+
+````text
+请在我的 Windows 电脑上安装 Ring Dock，并把桌面图标收纳到圆环分类里。请实际操作浏览器、PowerShell 和 Windows 桌面，不要只给我步骤。项目官方仓库是 https://github.com/stollor/ring-dock 。
+
+1. 从 https://github.com/stollor/ring-dock/releases/latest 下载最新的 `ring-dock-v...-windows-x64.zip` 和同一 Release 的 `SHA256SUMS.txt`。不要下载源码包或第三方 exe。用 `Get-FileHash -Algorithm SHA256` 核对 ZIP；校验不一致或没有该文件时停止。
+2. 解压到 `%LOCALAPPDATA%\Programs\RingDock`。如果目录已有 `config.json`，保留它和原收藏，不要用默认配置覆盖。启动 `ring-dock.exe` 一次，并等到同目录的 `config.json` 存在。
+3. 如果启动时出现 UAC，先向我说明这是为了运行可选的 WinMemoryCleaner 内存整理助手，并等待我自己决定；不要替我点击 UAC。拒绝后继续使用圆环。
+4. 在桌面创建或更新 `ring-dock.exe` 的快捷方式，图标位置设为该 exe 路径、索引 0，使用程序内嵌的圆环图标。不要从网上另找图标，不要重复创建快捷方式。
+5. 用下面命令下载与当前 Release 标签完全匹配的官方桌面导入脚本。把 `$installDir` 改成实际安装目录；先做只读预览，再自动导入。导入脚本递归扫描当前用户桌面和公共桌面的 `.lnk`、`.url`、`.website`、`.appref-ms` 快捷方式，按来源文件夹或目标类型分类，跳过已收藏路径；它不会执行快捷方式、移动/删除源文件或上传配置。正式导入前会在配置旁创建备份。
+
+```powershell
+$installDir = Join-Path $env:LOCALAPPDATA 'Programs\RingDock'
+$configPath = Join-Path $installDir 'config.json'
+$release = Invoke-RestMethod -Uri 'https://api.github.com/repos/stollor/ring-dock/releases/latest'
+$scriptPath = Join-Path $env:TEMP ("ring-dock-import-" + $release.tag_name + '.ps1')
+$scriptUrl = "https://raw.githubusercontent.com/stollor/ring-dock/$($release.tag_name)/tools/orbit/import_desktop.ps1"
+$reportPath = Join-Path $env:TEMP ("ring-dock-import-" + [guid]::NewGuid().ToString('N') + '.json')
+Invoke-WebRequest -Uri $scriptUrl -OutFile $scriptPath
+
+try {
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File $scriptPath -ConfigPath $configPath -ScanOnly -ReportPath $reportPath | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw '桌面快捷方式预览失败，停止导入。' }
+    $preview = Get-Content -LiteralPath $reportPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    $preview | Select-Object discovered, added, duplicates
+    $preview.items | Group-Object category | Select-Object Name, Count
+
+    if ($preview.discovered -gt 0) {
+        powershell.exe -NoProfile -ExecutionPolicy Bypass -File $scriptPath -ConfigPath $configPath -ReportPath $reportPath | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw '桌面快捷方式导入失败，请保留现有配置。' }
+        $result = Get-Content -LiteralPath $reportPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        $result | Select-Object added, duplicates, backup
+    }
+} finally {
+    Remove-Item -LiteralPath $reportPath -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $scriptPath -Force -ErrorAction SilentlyContinue
+}
+```
+
+6. 导入脚本只处理快捷方式。把桌面根目录中未被导入的普通文件和文件夹，通过文件资源管理器拖到圆环对应分类的展开面板里收藏；跳过回收站、“此电脑”和用于分类的文件夹本身。只添加桌面上的项目，不继续扫描其他磁盘。拖入只收藏路径，不移动或删除原件。
+7. 右键圆环打开“设置”，按我的桌面内容选择分类图标和圆环显示方式。不要运行或逐个打开桌面项目。不要把完整路径、导入报告或 `config.json` 内容贴到聊天里。
+8. 最后告诉我安装目录、快捷方式位置、导入数量和分类数量、配置备份位置，以及卸载方法。不要删除我的源文件；卸载时先询问我是否保留 `config.json`。
+````
 
 > 首次启动时，如果检测到可选的 WinMemoryCleaner，程序会请求一次管理员权限来启动内存整理助手。拒绝授权不会阻止圆环运行，只会停用内存整理功能。天气查询只在用户点击设置中的定位按钮后发起。
 
