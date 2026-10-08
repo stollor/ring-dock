@@ -3,8 +3,7 @@
 **把常用应用、文件和文件夹放进桌面上的透明圆环。** 点击分类展开快捷面板，点一下即可打开收藏。适用于 Windows 10/11 x64，免安装，支持鼠标操作。
 
 <p align="center">
-  <img src="docs/images/desktop-closed.png" width="320" alt="桌面上的 Ring Dock 圆环" />
-  <img src="docs/images/desktop-expanded.png" width="320" alt="展开后的分类快捷面板" />
+  <img src="docs/images/hero-desktop.png" width="100%" alt="清新山野桌面上的 Ring Dock 圆环" />
 </p>
 
 ## 下载和启动
