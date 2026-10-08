@@ -1,6 +1,10 @@
 # Ring Dock
 
+[English](README.en.md) · 简体中文
+
 **把常用应用、文件和文件夹放进桌面上的透明圆环。** 点击分类展开快捷面板，点一下即可打开收藏。适用于 Windows 10/11 x64，免安装，支持鼠标操作。
+
+**轻量省内存。** 圆环和面板按实际可见范围渲染，收起时会释放面板的大型缓冲区；面板图标按需加载。在 Windows 11、2560×1392 的本机测量中，打开全部分类两轮再收起后，正式实例的私有工作集约 **12.7 MiB**。同一配置下，优化前后预览实例的私有工作集从 **26.9 MiB** 降至 **11.9 MiB**，约减少 **56%**。实际数值会随 Windows、图标和桌面环境变化；这里的私有工作集表示当前驻留在物理内存中的进程私有页，不等同于总工作集或内存保证。测量条件和数据见[内存占用说明](docs/内存占用测量.md)。
 
 <p align="center">
   <img src="docs/images/hero-desktop.png" width="100%" alt="清新山野桌面上的 Ring Dock 圆环" />
@@ -49,7 +53,7 @@ Invoke-WebRequest "https://raw.githubusercontent.com/$repo/$tag/tools/install/in
   <img src="docs/images/ai-assistant-panel.png" width="520" alt="Ring Dock 展开 AI 助手分类后的应用收藏面板" />
 </p>
 
-右键打开设置后，可以开启“登录 Windows 时自动启动 Ring Dock”，也可以选择分类图标的显示方式、每个分类的图标、面板条目图标样式、时钟格式、透明度和布局。圆环图标可以自动匹配分类，也可以单独指定协作、开发、AI、娱乐、程序、文件、文件夹或网址图标。
+默认情况下，面板条目使用 Windows 原图标，圆环分类只显示图标、不显示文字。右键打开设置后，可以开启“登录 Windows 时自动启动 Ring Dock”，也可以修改分类图标显示方式、每个分类的图标、面板条目图标样式、时钟格式、透明度和布局。圆环图标可以自动匹配分类，也可以单独指定协作、开发、AI、娱乐、程序、文件、文件夹或网址图标。
 
 <p align="center">
   <img src="docs/images/settings.png" width="420" alt="分类与图标设置窗口" />

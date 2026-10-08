@@ -35,10 +35,10 @@ pub struct Config {
     pub clock_format: String,
     /// 图标尺寸（含名称格高约 +20）
     pub icon_size: f32,
-    /// 面板条目图标风格；旧配置缺省为统一线条风格。
+    /// 面板条目图标风格；缺省使用 Windows 原图标。
     #[serde(default)]
     pub icon_style: IconStyle,
-    /// 圆环分类在图标、弧形文字和组合显示间切换。
+    /// 圆环分类缺省只显示图标，也可切换为文字或组合显示。
     #[serde(default)]
     pub category_display_mode: CategoryDisplayMode,
     /// 面板图标横向间距
@@ -72,11 +72,11 @@ pub struct Config {
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum IconStyle {
-    /// 当前的统一线条图标。
-    #[default]
-    Unified,
     /// Windows Shell 返回的原始图标。
+    #[default]
     Original,
+    /// 统一线条图标。
+    Unified,
     /// Windows Shell 图标经过统一冷色调处理。
     Tinted,
 }
@@ -84,9 +84,9 @@ pub enum IconStyle {
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum CategoryDisplayMode {
+    #[default]
     Icon,
     Text,
-    #[default]
     Both,
 }
 
@@ -117,7 +117,7 @@ impl Default for Config {
             clock_format: "%H:%M".into(),
             icon_size: 48.0,
             icon_style: IconStyle::default(),
-            category_display_mode: CategoryDisplayMode::Both,
+            category_display_mode: CategoryDisplayMode::Icon,
             item_gap: 12.0,
             row_gap: 16.0,
             panel_padding: 16.0,

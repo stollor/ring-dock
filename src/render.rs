@@ -816,7 +816,14 @@ impl Renderer {
             let _ = std::fs::write(format!("{}.json", path.to_string_lossy()), meta.to_string());
             let _ = std::fs::write(path, bytes);
         }
-        deskpin::place_rect(hwnd, bounds.left, bounds.top, back.w, back.h);
+        // Submit the new position, size, and pixels together. Moving the layered
+        // window with SetWindowPos first briefly displays the previous bitmap at
+        // the new origin (visible as a misplaced ring when a panel opens).
+        let (work_x, work_y, _, _) = deskpin::work_area();
+        let dst = POINT {
+            x: work_x + bounds.left,
+            y: work_y + bounds.top,
+        };
         let size = SIZE {
             cx: back.w,
             cy: back.h,
@@ -832,7 +839,7 @@ impl Renderer {
             UpdateLayeredWindow(
                 hwnd,
                 None,
-                None,
+                Some(&dst),
                 Some(&size),
                 Some(back.dc),
                 Some(&src),

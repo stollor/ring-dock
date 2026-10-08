@@ -1,4 +1,4 @@
-﻿param([string]$Exe='', [string]$ReportDir='')
+param([string]$Exe='', [string]$ReportDir='', [switch]$SkipBackdropMutationCheck)
 $ErrorActionPreference='Stop'
 $root=(Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 if(-not $Exe){$Exe=Join-Path $root 'target\release\ring-dock.exe'}
@@ -9,7 +9,12 @@ $report=if($ReportDir){[IO.Path]::GetFullPath($ReportDir)}else{Join-Path $root '
 $observerDir=Join-Path $root 'target\orbit-test';New-Item -ItemType Directory -Force $observerDir|Out-Null
 & (Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe') /nologo /target:exe /platform:x64 /r:System.Windows.Forms.dll /r:System.Drawing.dll ("/win32manifest:"+(Join-Path $root 'assets\app.manifest')) ("/out:"+(Join-Path $observerDir 'desktop-observer.exe')) (Join-Path $PSScriptRoot 'desktop_observer.cs')
 if($LASTEXITCODE -ne 0){throw 'Observer compilation failed'}
-$cfgPath=Join-Path $out 'isolated-config.json';$base=Join-Path $root 'target\release\config.json';if(-not (Test-Path $base)){$base=Join-Path $PSScriptRoot 'fixture.json'};Copy-Item $base $cfgPath
+$cfgPath=Join-Path $out 'isolated-config.json';$base=Join-Path $root 'target\release\config.json';if(-not (Test-Path $base)){$base=Join-Path $PSScriptRoot 'fixture.json'}
+$cfg=Get-Content $base -Raw|ConvertFrom-Json
+# A desktop regression fixture must not start the optional elevated memory broker.
+# An explicit missing path makes initialization fail safely without prompting UAC.
+$cfg|Add-Member -NotePropertyName win_memory_cleaner_path -NotePropertyValue 'Z:\__orbit_test_no_cleaner.exe' -Force
+$cfg|ConvertTo-Json -Depth 10|Set-Content $cfgPath -Encoding utf8
 $checks=[Collections.Generic.List[object]]::new()
 function Assert($ok,$name){$checks.Add(@{name=$name;pass=[bool]$ok});if(-not $ok){throw "FAIL: $name"};Write-Host "PASS: $name"}
 function Meta {Get-Content (Join-Path $out 'frame.bgra.json') -Raw|ConvertFrom-Json}
@@ -19,7 +24,6 @@ function Capture($name,$controlled=$false){
  $x=[int]($m.center[0]-$width/2);$y=[int]($m.center[1]-195)
  $prefix=Join-Path $report $name
  $args=@($script:h.ToInt64(),$x,$y,$width,$height,('"'+$prefix+'"'));if($controlled){$args+='--controlled';$args+=('"'+(Join-Path $out 'frame.bgra')+'"')}
- $before=(Get-FileHash (Join-Path $out 'frame.bgra')).Hash
  $p2=Start-Process (Join-Path $root 'target\orbit-test\desktop-observer.exe') -ArgumentList $args -PassThru -WindowStyle Hidden -RedirectStandardError (Join-Path $out 'observer-errors.txt')
  if(-not $p2.WaitForExit(5000)){Stop-Process -Id $p2.Id;throw 'Observer timed out'}
  Assert ($p2.ExitCode -eq 0) "DWM 实际桌面截图 $name"
@@ -37,7 +41,7 @@ try{
  [OrbitControl]::ShowWindow($script:h,4)|Out-Null;Start-Sleep -Milliseconds 400
  $parent=[OrbitControl]::GetParent($script:h);Assert ($parent -ne [IntPtr]::Zero) "已嵌入真实桌面宿主 $([OrbitControl]::Class($parent))"
  Assert (([OrbitControl]::GetWindowLongW($script:h,-20) -band 8) -eq 0) '正式桌面模式非 TOPMOST'
- Capture 'desktop-closed';Capture 'desktop-alpha' $true
+ Capture 'desktop-closed';Capture 'desktop-alpha' (-not $SkipBackdropMutationCheck)
  $m=Meta;[OrbitControl]::Click($script:h,[int]($m.center[0]+$m.radius/[Math]::Sqrt(2)),[int]($m.center[1]-$m.radius/[Math]::Sqrt(2)))
  Assert ([OrbitControl]::Title($script:h) -eq 'ring-dock#expanded=0') '桌面嵌入分类展开';Capture 'desktop-expanded'
  $l=(Meta).panel;[OrbitControl]::Click($script:h,[int]($l.x+$l.w-68),[int]($l.y+27));Capture 'desktop-editing'
