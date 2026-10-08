@@ -7,3 +7,6 @@ config.json
 # 临时诊断/截图
 *.log
 *.bmp
+
+# 本机验证截图、诊断日志与任务报告
+/reports/

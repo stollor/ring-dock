@@ -1,0 +1,41 @@
+name: Build Windows release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  windows-x64:
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7.0.1
+
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Build release executable
+        run: cargo +stable build --release --locked
+
+      - name: Package and publish release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $version = $env:GITHUB_REF_NAME
+          $stage = Join-Path $env:RUNNER_TEMP "ring-dock-$version"
+          $zip = Join-Path $env:RUNNER_TEMP "ring-dock-$version-windows-x64.zip"
+          $hashFile = Join-Path $env:RUNNER_TEMP "SHA256SUMS.txt"
+
+          New-Item -ItemType Directory -Force $stage | Out-Null
+          Copy-Item "target/release/ring-dock.exe" $stage
+          Copy-Item "docs/快速上手.md" (Join-Path $stage "快速上手.txt")
+          Compress-Archive -Path (Join-Path $stage "*") -DestinationPath $zip
+
+          $hash = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLowerInvariant()
+          "$hash  $(Split-Path -Leaf $zip)" | Set-Content -Encoding ascii $hashFile
+          gh release create $version $zip $hashFile --title "Ring Dock $version" --generate-notes

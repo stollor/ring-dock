@@ -1,109 +1,65 @@
-# Ring Dock · Orbit Glass
+# Ring Dock
 
-Windows 桌面圆环收纳工具。当前界面使用真正的逐像素透明：暗色玻璃、四色细线光轨、清晰时钟与下置收藏面板。
+**把常用应用、文件和文件夹放进桌面上的透明圆环。** 点击分类展开快捷面板，点一下即可打开收藏。适用于 Windows 10/11 x64，免安装，支持鼠标操作。
 
-## 当前渲染与设计
+<p align="center">
+  <img src="docs/images/desktop-closed.png" width="320" alt="桌面上的 Ring Dock 圆环" />
+  <img src="docs/images/desktop-expanded.png" width="320" alt="展开后的分类快捷面板" />
+</p>
 
-- `Direct2D / DirectWrite → 32-bit 预乘 BGRA DIB → UpdateLayeredWindow(ULW_ALPHA)`。
-- 桌面宿主由独立 `deskpin` 库管理；生产窗口嵌入桌面，**不置顶盖住应用**。
-- 背景半透明，文字主体不随玻璃透明度一起变淡；DirectWrite 使用灰度抗锯齿，避免透明表面的 ClearType 彩边。
-- 不抓壁纸、不缓存屏幕充当背景、不使用色键、文字区域挖洞或 `SetWindowRgn`。
-- 当前是透明玻璃视觉，**不是 Acrylic / 实时背景模糊**。不要把半透明和毛玻璃模糊混为一谈。
-- 圆环保持可用；下方独立面板包含整理/完成、关闭、滚动条、空状态、拖放/启动错误提示。
-- 展开有 160ms 淡入，结束停止动画定时器。没有常驻高频动画。
-- 绘制缓冲与透明窗口只覆盖圆环及展开面板的边界，收起即释放大缓冲。可见时环境动画最高约 15 FPS，被前台窗口完全遮挡时停止动画定时器；160ms 展开动画独立运行。原图标按可见行加载，缓存上限 128 项，切换分类、样式或删除收藏会淘汰旧资源；提取结果队列上限 32，同一时间只有一批提取任务。
+## 下载和启动
 
-## 操作
+1. 打开 **[最新版本下载页](https://github.com/stollor/ring-dock/releases/latest)**，下载 `ring-dock-v...-windows-x64.zip`。
+2. 将压缩包解压到你有写入权限的文件夹，例如 `%LOCALAPPDATA%\Programs\RingDock`。
+3. 双击 `ring-dock.exe`。程序会把设置保存在 exe 同目录的 `config.json`。
 
-| 操作 | 结果 |
-|---|---|
-| 点分类弧片 | 展开；再点相同分类收起 |
-| 展开时点其他分类 | 按设置切换分类，或先收起 |
-| 点中心 / 面板 × | 整理态退出整理；面板展开时中心收起；圆环收起时点中心清理旧临时文件并请求低优先级内存整理；× 直接收起 |
-| 点面板空白 | 保持打开，不误关闭 |
-| 点收藏 | 正常模式打开目标；失败保留面板并提示 |
-| 点「整理」或长按面板 550ms | 进入整理；拖动换位，点 − 移除收藏（不删除原文件） |
-| 按住鼠标中键（滚轮）拖动 | 从圆环或面板任意可见位置移动整个挂件；松开保存位置，重启恢复 |
-| 滚轮 | 超长内容内部滚动；中键移动过程中暂不滚动 |
-| 拖文件经过分类 400ms | 自动展开该分类；移到面板松开，加入并保存 |
-| 重复拖入同一路径 | 忽略重复项 |
-| 右键圆环 / 托盘 | 设置、重载、打开配置、退出 |
+程序自带圆环应用图标。想放到桌面时，右键 `ring-dock.exe` 创建快捷方式；快捷方式会使用 exe 内嵌图标。也可以让 AI 按你的习惯安装并整理图标：[打开 AI 安装与图标整理提示词](docs/AI安装与图标整理提示词.md)。
 
-完全透明区域交给下层桌面处理，所以**不承诺在任意外部位置点击都能关闭面板**。窗口不抢键盘焦点，当前不把全局 Esc 当作已完成能力。
+> 首次启动时，如果检测到可选的 WinMemoryCleaner，程序会请求一次管理员权限来启动内存整理助手。拒绝授权不会阻止圆环运行，只会停用内存整理功能。天气查询只在用户点击设置中的定位按钮后发起。
 
-拖放是收藏路径，不搬移原文件。接受 `CF_HDROP` 且源允许 COPY；不接受仅允许 MOVE 的源或纯文本源。`.lnk` / `.url` 使用 ShellExecute 打开。
+## 怎么用
 
-## 配置
+| 操作 | 效果 |
+| --- | --- |
+| 点击圆环上的分类 | 展开该分类的快捷面板；再点一次收起 |
+| 点击收藏项 | 打开对应的应用、文件、文件夹或网址 |
+| 把文件或快捷方式拖到展开的面板 | 收藏它；原文件不会移动或删除 |
+| 点击“整理” | 拖动条目调整顺序，点击减号移除收藏 |
+| 按住鼠标中键拖动圆环或面板 | 移动挂件；松开后记住位置 |
+| 右键圆环或托盘图标 | 打开设置、重新加载配置或退出 |
 
-默认读取 exe 同目录 `config.json`；字段兼容旧配置。保存采用同目录临时文件、flush/sync 和 Windows 原子替换。保存错误在面板提示，不静默伪装成功。
+右键打开设置后，可以选择分类图标的显示方式、每个分类的图标、面板条目图标样式、时钟格式、透明度和布局。圆环图标可以自动匹配分类，也可以单独指定协作、开发、AI、娱乐、程序、文件、文件夹或网址图标。
 
-支持 2–8 分类、透明度、三种时钟格式、图标大小、间距、列数、滚动高度、切换分类及启动后收起偏好。设置中的“圆环分类显示”可选只显示图标、只显示沿圆弧排布的文字，或同时显示图标和文字；“各分类图标”可单独选择自动语义图标、对话气泡、代码、AI 星芒、播放按钮、程序窗口、文件、文件夹或网址图标。旧配置默认使用图标和文字、按分类名称自动选图标。设置中的“面板条目图标样式”可选统一默认线条图标、Windows 原图标，或经过低饱和冷色调处理的原图标。异常数值会归一化。`dock_position: {"x": 0.5, "y": 0.4}` 保存主屏工作区中的相对中心位置；旧配置无该字段时使用默认位置。边缘保留圆环与阴影，靠近底部时面板改在上方展开。当前仍限主屏工作区，不宣称跨屏拖动。
+<p align="center">
+  <img src="docs/images/settings.png" width="420" alt="分类与图标设置窗口" />
+</p>
 
-收起圆环后点击中心会清理当前用户 `%TEMP%` 下超过 24 小时的文件，跳过正在使用的文件和重解析点，并显示释放的磁盘空间。内存整理调用 WinMemoryCleaner 的 `/StandbyListLowPriority` 命令。启动 ring-dock 时会请求一次 UAC，以启动仅处理内存整理的后台助手；助手随 ring-dock 运行，点击清理时不再重复弹窗，主界面保持普通权限。默认从 ring-dock 同目录、`%LOCALAPPDATA%\RingDock`、PATH、常见 WinGet/Scoop/Program Files 位置查找，也可在 `config.json` 设置 `win_memory_cleaner_path` 指向 `WinMemoryCleaner.exe`。当前用户级便携版存放在 `%LOCALAPPDATA%\RingDock\WinMemoryCleaner.exe`，来源为[官方 3.0.8 发布页](https://github.com/IgorMundstein/WinMemoryCleaner/releases/tag/3.0.8)，GPL-3.0。未找到工具时仍会完成临时文件清理并提示内存整理未执行。
+## 它有什么不同
 
-诊断仅显式启用：
+- **圆环直接贴合桌面。** 正式窗口嵌入 Windows 桌面，不会置顶盖住正在使用的应用。
+- **真实逐像素透明。** 能看到圆环下方的壁纸；界面是半透明玻璃质感，不提供实时背景模糊。
+- **桌面图标照常使用。** 透明区域会把点击交给下面的桌面。
+- **只收藏快捷方式和路径。** 加入或移除收藏不会搬动、删除原文件。
+- **设置保存在本地。** 不上传收藏列表或个人配置。
 
-- `RING_DOCK_CONFIG`：隔离配置路径。
-- `RING_DOCK_FRAME`：输出当前原始预乘 BGRA 帧（前 8 bytes 是 little-endian i32 宽、高）与布局 JSON；正式运行不要启用，避免诊断磁盘写入。
-- `RING_DOCK_DROP_LOG`：明确的拖放日志文件路径；默认无日志。
-- `--preview`：不嵌入桌面，临时置顶用于隔离验证；**不是正式运行参数**。
+## 下载包内容
 
-## 构建 / 回归
+每次发布 `v` 开头的版本标签后，GitHub Actions 会在 Windows 上构建程序，并生成 Windows x64 ZIP 与 SHA-256 校验文件。下载页面只提供 Ring Dock 本身；清理助手是可选组件，未安装时圆环和快捷面板仍可使用。
 
-需要 Windows、Rust MSVC 工具链以及 Windows SDK 资源编译器。
+## 从源码构建
+
+开发环境需要 Windows、Rust MSVC 工具链和 Windows SDK 资源编译器：
 
 ```powershell
-cargo fmt --all -- --check
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
-cargo build --release
-.\target\release\ring-dock.exe
+cargo build --release --locked
 ```
 
-可信回归脚本（先正常退出正式实例，避免同位置两个桌面挂件干扰观察；脚本不写正式配置）：
+生成的程序位于 `target\release\ring-dock.exe`。图标资源在 `assets\ring.ico`。
 
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File tools\orbit\verify.ps1 -Exe E:\tools\ring-dock\target\release\ring-dock.exe
-powershell -NoProfile -ExecutionPolicy Bypass -File tools\orbit\verify_drag.ps1 -Exe E:\tools\ring-dock\target\release\ring-dock.exe
-powershell -NoProfile -ExecutionPolicy Bypass -File tools\orbit\verify_desktop.ps1
-python tools\orbit\verify_controlled_pixels.py
-```
+## 项目说明
 
-脚本按 PID 选择自己的窗口、使用隔离配置、结束退出测试进程。真实点击/拖放会短暂移动鼠标后恢复位置，不要在此期间操作鼠标。桌面验证用临时 DWM 观测窗，另用蓝/黄受控底色验证实际合成；截图仅用于测试，从不进入正式渲染管线。C# 辅助程序由系统 .NET Framework 编译器生成；像素检查用 Python + Pillow。
+Ring Dock 面向 Windows 桌面，使用 Rust、Direct2D、DirectWrite 与 Windows 分层窗口。当前主要验证环境为 Windows 11；其他 Windows 版本、桌面增强软件和多屏 DPI 组合尚未逐一验证。详见[当前能力与限制](docs/当前能力与限制.md)。
 
-## 项目布局
+本仓库尚未声明开源许可证。你可以下载和运行发布包；公开可见不等于允许复制、修改或再发布源码。
 
-- `src/render.rs`：唯一正式绘制管线、共享面板几何。
-- `src/hit.rs`：与绘制共用布局的命中判定。
-- `src/main.rs`：状态、交互、窗口重建与资源生命周期。
-- `src/drop.rs`：OLE 文件收纳、格式/效果过滤、去重。
-- `src/config.rs`：配置、参数归一化、原子保存。
-- `crates/deskpin/`：桌面挂载，不掺业务渲染。
-- `tools/orbit/` / `reports/orbit-glass/`：当前回归与实际画面证据。
-- `tools/transparency/` / `reports/transparency/`：前一轮独立半透明验证。
-- `archive/legacy-region-20261003/`：停用实现与历史文档，不参与编译，不作为当前约束。
-
-## 验证边界
-
-本次实际测试系统为 Windows NT 10.0.26200.0，真实宿主 `SysListView32`。当前验证不等于所有 Windows 版本、所有桌面壁纸工具或多屏 DPI 组合均已兼容。Explorer 重启与 Win+D 未在本轮主动触发；窗口自愈通过销毁本应用自身窗口验证。背景模糊、全局键盘导航和多屏布局不是本次已交付能力。
-
-详细结果见 `reports/orbit-glass/REPORT.md`；历史“桌面不能半透明”的绝对结论已作废。
-
-## 桌面快捷方式导入
-
-2026-10-03 已将用户桌面、公共桌面以及桌面文件夹中的 61 个快捷方式加入正式配置，保留原有 9 个收藏；58 个程序快捷方式加入「程序」，3 个 URL 快捷方式加入「网址」。不移动/删除/改写源文件，保留原 `.lnk` / `.url` 路径（ShellExecute 保留启动参数、工作目录、协议等语义）。扫描不执行快捷方式。
-
-复用导入工具时先正常退出正式实例，避免并发写配置。默认递归用户与公共桌面，不跟随目录重解析点。去重覆盖所有分类，不区分路径大小写；重复导入不重新写盘。无效配置直接失败，不用默认收藏覆盖。写入前生成原配置备份，使用同目录临时文件与原子替换。
-
-```powershell
-# 先预览，不修改配置
-powershell -NoProfile -ExecutionPolicy Bypass -File tools\orbit\import_desktop.ps1 -ConfigPath E:\tools\ring-dock\target\release\config.json -ScanOnly
-# 正式导入（请先退出程序）
-powershell -NoProfile -ExecutionPolicy Bypass -File tools\orbit\import_desktop.ps1 -ConfigPath E:\tools\ring-dock\target\release\config.json
-# 新功能的隔离回归
-powershell -NoProfile -ExecutionPolicy Bypass -File tools\orbit\verify_middle_drag.ps1 -Exe E:\tools\ring-dock\target\release\ring-dock.exe
-powershell -NoProfile -ExecutionPolicy Bypass -File tools\orbit\verify_middle_drag.ps1 -Exe E:\tools\ring-dock\target\release\ring-dock.exe -Desktop
-powershell -NoProfile -ExecutionPolicy Bypass -File tools\orbit\verify_import.ps1
-```
-
-本轮证据与实际桌面图见 `reports/middle-drag/REPORT.md`。配置及 exe 改造前备份在 `target/backups/middle-drag-20261003/`，源码快照在 `target/before-middle-drag-20261003/`。回滚时不要用旧配置覆盖用户后来新增的收藏。
+遇到问题或想提出功能建议，可以到[问题反馈页](https://github.com/stollor/ring-dock/issues)。
