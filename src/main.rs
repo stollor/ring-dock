@@ -1,26 +1,14 @@
-//! ring-dock —— Windows 桌面圆环收纳工具（初版）
-//!
-//! 模块地图：
-//!   deskpin（独立 crate，零业务）——「固定显示在桌面上」全部能力：桌面树嵌入 / 挂载自愈 / 工作区摆放
-//!   hit.rs（命中测试纯函数 + 单测）、tray.rs（托盘）、settings_ui.rs（设置窗口）、render/blur/icons（绘制）
-//!
-//! 桌面挂件式常驻（动态壁纸/桌面贴图类软件的通行做法，调研结论见 README）：
-//!   - 窗口 SetParent 挂进桌面窗口树（挂载点降级链见 deskpin）→ 作为桌面子窗口：
-//!     天然在所有应用之下（不遮挡别的窗口），且不参与顶层窗口的最小化/
-//!     「显示桌面」（Win+D 只动 Progman 之外的普通应用窗口），结构性常驻
-//!   - 不用 WS_EX_TOPMOST：置顶反而盖住应用窗口，且 Win+D 照样把它最小化
-//!   - 纯预合成玻璃绘制（每帧先铺桌面快照，不再用色键色——品红中间帧会"闪紫"；
-//!     桌面子窗口不支持 UpdateLayeredWindow 逐像素 alpha，预合成出同样的半透明观感）
-//!   - SetWindowRgn 只保留「环带 ∪ 中心圆 ∪ 面板」：区域内可点，区域外不显示不拦截
-//!   - 挂载自愈（deskpin::Pinner::maintain）：Explorer 重启/换壁纸连带销毁子窗口 →
-//!     WM_DESTROY 重建并重挂；定时器低频校验挂载点与工作区几何（子窗口收不到 WM_DISPLAYCHANGE）
-//! 空闲近零 CPU：消息驱动；时钟文本无变化不重绘；桌面快照仅在展开/收起时抓取。
+//! Desktop Orbit Glass. True per-pixel alpha; no captured wallpaper or text regions.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod cleanup;
 mod config;
+mod drop;
+mod environment;
 mod hit;
 mod icons;
 mod open;
+mod placement;
 mod render;
 mod settings_ui;
 mod sys;
@@ -29,27 +17,41 @@ mod tray;
 use config::Config;
 use render::{Renderer, RingGeom, SceneState};
 use std::ffi::c_void;
-use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
-use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CombineRgn, CreateEllipticRgn, CreateRoundRectRgn, CreateSolidBrush,
-    DeleteObject, EndPaint, HBRUSH, HGDIOBJ, HRGN, PAINTSTRUCT, RGN_DIFF, RGN_OR,
-    SetWindowRgn,
+use std::net::TcpStream;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+use windows::core::PCWSTR;
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, HBRUSH, PAINTSTRUCT};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
-    DispatchMessageW, GetCursorPos, GetMessageW, GetWindowLongPtrW, LoadCursorW, PostQuitMessage,
-    RegisterClassW, SetTimer, SetWindowLongPtrW, ShowWindow, TrackPopupMenu, TranslateMessage,
-    CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, HMENU, IDC_ARROW, MF_STRING, MSG,
-    SW_SHOWNOACTIVATE,
-    TPM_RIGHTBUTTON, WM_COMMAND, WM_DESTROY, WM_DISPLAYCHANGE, WM_ERASEBKGND, WM_LBUTTONDBLCLK,
-    WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MOUSEWHEEL, WM_NCCREATE, WM_PAINT, WM_RBUTTONUP, WM_TIMER, WNDCLASSW,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
+    DispatchMessageW, GetCursorPos, GetMessageW, GetWindowLongPtrW, KillTimer, LoadCursorW,
+    PostMessageW, PostQuitMessage, RegisterClassW, SetTimer, SetWindowLongPtrW, ShowWindow,
+    TrackPopupMenu, TranslateMessage, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, HMENU, IDC_ARROW,
+    IDC_HAND, IDC_SIZEALL, MF_STRING, MSG, SW_SHOWNOACTIVATE, TPM_NONOTIFY, TPM_RETURNCMD,
+    TPM_RIGHTBUTTON, WM_APP, WM_CANCELMODE, WM_CAPTURECHANGED, WM_COMMAND, WM_DESTROY,
+    WM_DISPLAYCHANGE, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_PAINT, WM_RBUTTONUP,
+    WM_SETCURSOR, WM_TIMER, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_POPUP,
 };
-use windows::core::PCWSTR;
 
+const WM_MOUSELEAVE: u32 = 0x02A3;
 const CLASS_VISUAL: &str = "RingDockVisual";
 const TIMER_TICK: usize = 1;
+const TIMER_FRAME: usize = 4;
+const FRAME_INTERVAL_MS: u32 = 66;
+const TIMER_ANIMATE: usize = 3;
+const WM_RECREATE: u32 = WM_APP + 42;
+const WM_CLEANUP_DONE: u32 = WM_APP + 43;
+const WM_ENVIRONMENT_READY: u32 = WM_APP + 45;
+const WM_LOCATION_READY: u32 = WM_APP + 46;
+/// 长按定时器：按住超过 HOLD_MS 进入编辑态
+const TIMER_HOLD: usize = 2;
+const HOLD_MS: u32 = 550;
 const MENU_SETTINGS: usize = 104;
 const MENU_RELOAD: usize = 101;
 const MENU_OPENCFG: usize = 102;
@@ -66,6 +68,13 @@ struct App {
     renderer: Renderer,
     hwnd: HWND,
     last_clock: String,
+    environment: Option<environment::EnvironmentSnapshot>,
+    environment_status: String,
+    environment_refreshing: bool,
+    animation_origin: Instant,
+    resources: crate::sys::ResourceUsage,
+    resource_sampler: crate::sys::ResourceSampler,
+    resources_paused: bool,
     /// 退出标志：区分「用户退出」与「桌面宿主被销毁后重建窗口」两种 WM_DESTROY
     quitting: bool,
     /// 500ms 心跳计数（低频挂载自愈用）
@@ -76,103 +85,171 @@ struct App {
     tray: tray::Tray,
     /// "TaskbarCreated" 广播消息 ID（Explorer 重启后重建托盘）
     msg_taskbar: u32,
-    /// 待交还桌面重绘的区域（点击路径不跨进程，由定时器低频处理）
-    pending_repaint: Option<RECT>,
+    /// 编辑态（长按进入：可删除条目 / 拖动换位）
+    edit_mode: bool,
+    /// 按下点（长按判定以它为准：按住时轻微移动不取消）
+    press_pt: Option<(f32, f32)>,
+    /// 本次按下是否已被长按消费（消费后抬起不再当作点击）
+    press_consumed: bool,
+    /// 编辑态拖动中的条目序号
+    drag_item: Option<usize>,
+    /// 中键移动整个挂件，与左键排序独立；只在结束时持久化。
+    dock_drag: Option<placement::DockDrag>,
+    hover: hit::Hit,
+    panel_alpha: f32,
+    animation: Option<Instant>,
+    drop_hot: bool,
+    drag_hover: Option<(usize, Instant)>,
+    status: Option<(String, Instant)>,
+    cleanup_running: bool,
+    cleanup_result: Arc<Mutex<Option<String>>>,
+    memory_broker: Option<Arc<Mutex<TcpStream>>>,
+    preview: bool,
 }
 
 impl App {
-    /// 展开/收起：刷新桌面快照（混色底 + 面板模糊底）+ 命中区域 + 重绘
     fn set_expanded(&mut self, qi: Option<usize>) {
-        // 面板消失/切换后，旧面板区交还桌面树重绘（layered 窗口由 DWM 合成，一般无残影，保险）
-        let old_area = self.expanded.map(|q| {
-            let rc = self.panel_rect_win(q);
-            RECT {
-                left: self.origin.0 + rc.left,
-                top: self.origin.1 + rc.top,
-                right: self.origin.0 + rc.right,
-                bottom: self.origin.1 + rc.bottom,
-            }
-        });
-        self.expanded = qi;
+        self.cancel_press();
+        let next = qi.filter(|&i| i < self.cfg.quadrants.len());
+        let switching_category =
+            matches!((self.expanded, next), (Some(current), Some(next)) if current != next);
+        self.expanded = next;
         self.scroll = 0.0;
-        self.update_hit_rgn();
+        self.edit_mode = false;
+        self.hover = hit::Hit::None;
+        self.drop_hot = false;
+        self.status = None;
+        self.panel_alpha = if self.expanded.is_some() && !switching_category {
+            0.20
+        } else {
+            1.0
+        };
+        self.animation = self
+            .expanded
+            .filter(|_| !switching_category)
+            .map(|_| Instant::now());
+        unsafe {
+            if self.animation.is_some() {
+                SetTimer(Some(self.hwnd), TIMER_ANIMATE, 16, None);
+            } else {
+                let _ = KillTimer(Some(self.hwnd), TIMER_ANIMATE);
+            }
+        }
+        self.sync_title();
         self.redraw();
-        // 旧面板区交还桌面重绘（保险）：不在此处跨进程调用（会拖慢点击），
-        // 记账后由定时器低频处理
-        self.pending_repaint = old_area.or(self.pending_repaint);
     }
-
-    /// 面板矩形（窗口客户区坐标；与 layout_panel 同源）
-    fn panel_rect_win(&self, qi: usize) -> RECT {
-        let items = self.cfg.quadrants.get(qi).map(|q| q.items.len()).unwrap_or(0);
-        let lay = render::layout_panel(&self.cfg, items, &self.geom, self.screen_w, self.screen_h, qi);
-        RECT {
-            left: lay.x as i32,
-            top: lay.y as i32,
-            right: (lay.x + lay.w).ceil() as i32 + 1,
-            bottom: (lay.y + lay.h).ceil() as i32 + 1,
+    fn refresh_panel(&mut self) {
+        if let Some(q) = self.expanded {
+            let n = self.cfg.quadrants.get(q).map_or(0, |q| q.items.len());
+            let l = render::layout_panel(&self.cfg, n, &self.geom, self.screen_w, self.screen_h, q);
+            self.scroll = self.scroll.clamp(0.0, l.scroll_max);
         }
+        self.sync_title();
+        self.redraw();
     }
-
-    /// 命中区域 = 环带（外圆-内圆） ∪ 中心圆 ∪ 面板（展开时）
-    fn update_hit_rgn(&self) {
+    fn hit_at(&self, x: f32, y: f32) -> hit::Hit {
+        hit::hit_test(
+            &self.cfg,
+            &self.geom,
+            self.screen_w,
+            self.screen_h,
+            self.expanded,
+            self.scroll,
+            self.edit_mode,
+            x,
+            y,
+        )
+    }
+    fn cancel_press(&mut self) {
+        self.press_pt = None;
+        self.drag_item = None;
+        self.press_consumed = false;
         unsafe {
-            let r_out = self.geom.r_mid + self.geom.stroke / 2.0 + 1.0;
-            let r_in = self.geom.r_mid - self.geom.stroke / 2.0 - 1.0;
-            let outer: HRGN = CreateEllipticRgn(
-                (self.geom.cx - r_out) as i32,
-                (self.geom.cy - r_out) as i32,
-                (self.geom.cx + r_out) as i32,
-                (self.geom.cy + r_out) as i32,
-            );
-            let inner = CreateEllipticRgn(
-                (self.geom.cx - r_in) as i32,
-                (self.geom.cy - r_in) as i32,
-                (self.geom.cx + r_in) as i32,
-                (self.geom.cy + r_in) as i32,
-            );
-            let center = CreateEllipticRgn(
-                (self.geom.cx - r_in) as i32,
-                (self.geom.cy - r_in) as i32,
-                (self.geom.cx + r_in) as i32,
-                (self.geom.cy + r_in) as i32,
-            );
-            // 环带 = 外圆 - 内圆；再并上中心圆
-            let _ = CombineRgn(Some(outer), Some(outer), Some(inner), RGN_DIFF);
-            let _ = CombineRgn(Some(outer), Some(outer), Some(center), RGN_OR);
-            let _ = DeleteObject(HGDIOBJ(inner.0));
-            let _ = DeleteObject(HGDIOBJ(center.0));
-            if let Some(qi) = self.expanded {
-                let items = self.cfg.quadrants.get(qi).map(|q| q.items.len()).unwrap_or(0);
-                let lay = render::layout_panel(&self.cfg, items, &self.geom, self.screen_w, self.screen_h, qi);
-                let panel = CreateRoundRectRgn(
-                    lay.x as i32,
-                    lay.y as i32,
-                    (lay.x + lay.w) as i32 + 1,
-                    (lay.y + lay.h) as i32 + 1,
-                    24,
-                    24,
-                );
-                let _ = CombineRgn(Some(outer), Some(outer), Some(panel), RGN_OR);
-                let _ = DeleteObject(HGDIOBJ(panel.0));
+            let _ = KillTimer(Some(self.hwnd), TIMER_HOLD);
+            let _ = ReleaseCapture();
+        }
+    }
+    fn restore_position(&mut self) {
+        (self.geom.cx, self.geom.cy) = placement::restored_center(
+            self.cfg.dock_position,
+            self.screen_w,
+            self.screen_h,
+            self.geom.r_disc(),
+        );
+    }
+    fn on_middle_down(&mut self, x: f32, y: f32) {
+        if self.dock_drag.is_some() || self.hit_at(x, y) == hit::Hit::None {
+            return;
+        }
+        // 先结束左键手势，避免移动挂件时触发长按或意外启动条目。
+        if self.drag_item.is_some() {
+            self.save_items();
+        }
+        self.cancel_press();
+        self.dock_drag = Some(placement::DockDrag::new(
+            (x, y),
+            (self.geom.cx, self.geom.cy),
+        ));
+        self.hover = hit::Hit::None;
+        unsafe {
+            let _ = SetCapture(self.hwnd);
+        }
+        self.redraw();
+    }
+    fn move_dock(&mut self, x: f32, y: f32) {
+        if let Some(drag) = self.dock_drag {
+            let center = drag.center_at((x, y), self.screen_w, self.screen_h, self.geom.r_disc());
+            if center != (self.geom.cx, self.geom.cy) {
+                (self.geom.cx, self.geom.cy) = center;
+                self.refresh_panel();
             }
-            let _ = SetWindowRgn(self.hwnd, Some(outer), true);
+        }
+    }
+    fn finish_dock_drag(&mut self) {
+        let Some(drag) = self.dock_drag.take() else {
+            return;
+        };
+        if drag.start_center != (self.geom.cx, self.geom.cy) {
+            self.cfg.dock_position = Some(placement::normalized_center(
+                (self.geom.cx, self.geom.cy),
+                self.screen_w,
+                self.screen_h,
+            ));
+            self.save_items();
+        }
+        self.hover = hit::Hit::None;
+        self.redraw();
+    }
+    fn on_middle_up(&mut self, x: f32, y: f32) {
+        if self.dock_drag.is_none() {
+            return;
+        }
+        self.move_dock(x, y);
+        self.finish_dock_drag();
+        unsafe {
+            let _ = ReleaseCapture();
+        }
+    }
+    /// 窗口标题写入展开/编辑状态（测试观测点：窗口无标题栏，用户不可见）
+    fn sync_title(&self) {
+        let t = match self.expanded {
+            Some(qi) if self.edit_mode => format!("ring-dock#expanded={qi}#edit"),
+            Some(qi) => format!("ring-dock#expanded={qi}"),
+            None => "ring-dock".to_string(),
+        };
+        let wt = crate::sys::wide(&t);
+        unsafe {
+            let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowTextW(
+                self.hwnd,
+                windows::core::PCWSTR(wt.as_ptr()),
+            );
         }
     }
 
-    /// 重绘：直接拿窗口 DC 立即绘制（不赌 WM_PAINT 消息链）
     fn redraw(&mut self) {
-        unsafe {
-            let hdc = windows::Win32::Graphics::Gdi::GetDC(Some(self.hwnd));
-            if !hdc.is_invalid() {
-                self.paint(hdc);
-                let _ = windows::Win32::Graphics::Gdi::ReleaseDC(Some(self.hwnd), hdc);
-            }
+        if self.hwnd.is_invalid() {
+            return;
         }
-    }
-
-    /// WM_PAINT：把整帧画到窗口 DC
-    fn paint(&mut self, hdc: windows::Win32::Graphics::Gdi::HDC) {
         let state = SceneState {
             cfg: &self.cfg,
             geom: &self.geom,
@@ -180,12 +257,328 @@ impl App {
             screen_h: self.screen_h,
             expanded: self.expanded,
             scroll: self.scroll,
+            edit_mode: self.edit_mode,
+            hover: self.hover,
+            panel_alpha: self.panel_alpha,
+            drop_hot: self.drop_hot,
+            status: self.status.as_ref().map(|s| s.0.as_str()),
+            resources: self.resources,
+            second_phase: crate::sys::local_second_phase(),
+            local_time_seconds: {
+                let (hour, minute, second) = crate::sys::local_hms(0);
+                hour as f32 * 3600.0
+                    + minute as f32 * 60.0
+                    + second as f32
+                    + crate::sys::local_second_phase().fract()
+            },
+            environment: self.environment.as_ref(),
+            animation_time: self.animation_origin.elapsed().as_secs_f32(),
         };
-        if let Err(e) = self.renderer.draw(&state, self.hwnd, hdc) {
-            eprintln!("[ring-dock] 渲染失败：{e}");
+        if let Err(e) = self.renderer.draw(&state, self.hwnd) {
+            eprintln!("[ring-dock] {e}");
+        }
+    }
+    /// The ring is embedded beneath ordinary windows, so pause expensive updates when
+    /// the center chip is fully covered by the active window.
+    fn resource_region_visible(&self) -> bool {
+        let foreground = unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() };
+        if foreground.is_invalid() || foreground == self.hwnd {
+            return true;
+        }
+
+        let mut class_name = [0u16; 64];
+        let class_len = unsafe {
+            windows::Win32::UI::WindowsAndMessaging::GetClassNameW(foreground, &mut class_name)
+        };
+        if class_len > 0 {
+            let class_name = String::from_utf16_lossy(&class_name[..class_len as usize]);
+            if matches!(
+                class_name.as_str(),
+                "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd"
+            ) {
+                return true;
+            }
+        }
+
+        let mut foreground_rect = RECT::default();
+        if unsafe {
+            windows::Win32::UI::WindowsAndMessaging::GetWindowRect(foreground, &mut foreground_rect)
+        }
+        .is_err()
+        {
+            return true;
+        }
+
+        let radius = self.geom.r_chip();
+        let left = (self.origin.0 as f32 + self.geom.cx - radius).floor() as i32;
+        let top = (self.origin.1 as f32 + self.geom.cy - radius).floor() as i32;
+        let right = (self.origin.0 as f32 + self.geom.cx + radius).ceil() as i32;
+        let bottom = (self.origin.1 as f32 + self.geom.cy + radius).ceil() as i32;
+        let covered = foreground_rect.left <= left
+            && foreground_rect.top <= top
+            && foreground_rect.right >= right
+            && foreground_rect.bottom >= bottom;
+        !covered
+    }
+    fn start_weather_fetch(&mut self, location: environment::SystemLocation) {
+        if self.environment_refreshing {
+            return;
+        }
+        self.environment_refreshing = true;
+        self.environment_status = "正在获取天气".into();
+        self.redraw();
+        let hwnd = self.hwnd.0 as isize;
+        std::thread::spawn(move || {
+            let result = environment::fetch_weather(location);
+            post_environment_result(HWND(hwnd as *mut _), result);
+        });
+    }
+    fn request_system_location(&mut self) {
+        if self.environment_refreshing {
+            return;
+        }
+        self.environment_refreshing = true;
+        self.environment_status = "正在等待 Windows 定位授权".into();
+        self.redraw();
+        match environment::request_system_location_async(self.hwnd, WM_LOCATION_READY) {
+            Ok(()) => {}
+            Err(error) => {
+                self.environment_refreshing = false;
+                self.environment_status = error;
+                self.redraw();
+            }
+        }
+    }
+    fn start_initial_environment_lookup(&mut self) {
+        if self.environment_refreshing {
+            return;
+        }
+        self.environment_refreshing = true;
+        self.environment_status = "正在读取系统位置".into();
+        let hwnd = self.hwnd.0 as isize;
+        std::thread::spawn(move || {
+            let result = environment::read_system_location().and_then(environment::fetch_weather);
+            post_environment_result(HWND(hwnd as *mut _), result);
+        });
+    }
+    fn start_resource_cleanup(&mut self) {
+        if self.cleanup_running {
+            return;
+        }
+
+        self.cleanup_running = true;
+        self.status = Some(("正在清理旧临时文件…".into(), Instant::now()));
+        self.redraw();
+
+        let memory_broker = self.memory_broker.clone();
+        let result_slot = Arc::clone(&self.cleanup_result);
+        let hwnd = self.hwnd.0 as isize;
+        let worker = std::thread::Builder::new()
+            .name("ring-dock-temp-cleanup".into())
+            .spawn(move || {
+                let memory_status = match memory_broker {
+                    Some(broker) => cleanup::request_memory_cleanup(&broker)
+                        .unwrap_or_else(|error| format!("内存整理未执行：{error}")),
+                    None => "内存整理未执行：管理员助手未就绪".into(),
+                };
+                let temp_result = cleanup::clean_old_user_temp_files();
+                let message = match temp_result {
+                    Ok(summary) => {
+                        let temp_status = if summary.files_removed == 0 {
+                            "没有可删除的旧临时文件".to_string()
+                        } else {
+                            format!(
+                                "删除 {} 个旧临时文件，释放 {:.1} MB 磁盘空间",
+                                summary.files_removed,
+                                summary.bytes_removed as f64 / (1024.0 * 1024.0)
+                            )
+                        };
+                        format!("{temp_status}；{memory_status}")
+                    }
+                    Err(error) => format!("临时文件清理失败：{error}；{memory_status}"),
+                };
+                if let Ok(mut result) = result_slot.lock() {
+                    *result = Some(message);
+                }
+                unsafe {
+                    let _ = PostMessageW(
+                        Some(HWND(hwnd as *mut _)),
+                        WM_CLEANUP_DONE,
+                        WPARAM(0),
+                        LPARAM(0),
+                    );
+                }
+            });
+        if let Err(error) = worker {
+            self.cleanup_running = false;
+            self.status = Some((format!("无法启动清理任务：{error}"), Instant::now()));
+            self.redraw();
+        }
+    }
+    /// 面板内某个条目的格中心（命中/拖动共用布局）
+    fn cell_at(&self, x: f32, y: f32) -> Option<usize> {
+        match self.hit_at(x, y) {
+            hit::Hit::Item { index, .. } => Some(index),
+            _ => None,
         }
     }
 
+    /// 面板矩形内？（长按判定用）
+    fn point_in_panel_client(&self, x: f32, y: f32) -> bool {
+        let qi = match self.expanded {
+            Some(q) => q,
+            None => return false,
+        };
+        let items = self
+            .cfg
+            .quadrants
+            .get(qi)
+            .map(|q| q.items.len())
+            .unwrap_or(0);
+        let lay = render::layout_panel(
+            &self.cfg,
+            items,
+            &self.geom,
+            self.screen_w,
+            self.screen_h,
+            qi,
+        );
+        lay.contains(x, y)
+    }
+
+    /// 写回配置（删除/排序后）
+    fn save_items(&mut self) {
+        if let Err(e) = self.cfg.save() {
+            eprintln!("[ring-dock] 配置写回失败：{e}");
+            self.status = Some(("保存失败 · 本次改动尚未写入磁盘".into(), Instant::now()));
+            self.redraw();
+        }
+    }
+
+    /// 按下：起长按定时器 + 捕获鼠标；编辑态下按住条目=开始拖动换位
+    fn on_mouse_down(&mut self, x: f32, y: f32) {
+        crate::drop::dlog(&format!(
+            "MouseDown ({x},{y}) offset={:?}",
+            self.renderer.offset
+        ));
+        if self.dock_drag.is_some() {
+            return;
+        }
+        self.press_consumed = false;
+        self.press_pt = Some((x, y));
+        unsafe {
+            SetTimer(Some(self.hwnd), TIMER_HOLD, HOLD_MS, None);
+            let _ = SetCapture(self.hwnd);
+        }
+        if self.edit_mode {
+            // 只有按在条目本体上才开始拖动；删除角标由抬起时的点击处理
+            if let hit::Hit::Item { index, .. } = hit::hit_test(
+                &self.cfg,
+                &self.geom,
+                self.screen_w,
+                self.screen_h,
+                self.expanded,
+                self.scroll,
+                self.edit_mode,
+                x,
+                y,
+            ) {
+                self.drag_item = Some(index);
+            }
+        }
+    }
+
+    /// 长按超时：仍按住且按下点在面板上 → 进入编辑态（若停在条目上，顺带开始拖动）
+    fn on_hold(&mut self) {
+        let Some((x, y)) = self.press_pt else { return };
+        crate::drop::dlog(&format!(
+            "长按触发：按下点({x:.0},{y:.0}) expanded={:?} 在面板内={}",
+            self.expanded,
+            self.expanded.is_some() && self.point_in_panel_client(x, y)
+        ));
+        if self.expanded.is_some() && self.point_in_panel_client(x, y) {
+            unsafe {
+                let _ = KillTimer(Some(self.hwnd), TIMER_HOLD); // 已消费，停止重复触发
+            }
+            self.edit_mode = true;
+            self.press_consumed = true;
+            self.drag_item = self.cell_at(x, y);
+            self.sync_title();
+            self.redraw();
+        }
+    }
+
+    fn on_mouse_move(&mut self, x: f32, y: f32) {
+        if self.dock_drag.is_some() {
+            self.move_dock(x, y);
+            return;
+        }
+        unsafe {
+            let mut t = TRACKMOUSEEVENT {
+                cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                dwFlags: TME_LEAVE,
+                hwndTrack: self.hwnd,
+                dwHoverTime: 0,
+            };
+            let _ = TrackMouseEvent(&mut t);
+        }
+        if let Some((px, py)) = self.press_pt {
+            if (x - px).hypot(y - py) > 8.0 && !self.edit_mode {
+                self.press_consumed = true;
+                unsafe {
+                    let _ = KillTimer(Some(self.hwnd), TIMER_HOLD);
+                }
+            }
+        }
+        let h = self.hit_at(x, y);
+        if self.hover != h {
+            self.hover = h;
+            self.redraw();
+        }
+        if let (Some(index), Some(qi)) = (self.drag_item, self.expanded) {
+            if let Some(to) = self.cell_at(x, y) {
+                if to != index && self.cfg.move_item(qi, index, to) {
+                    self.drag_item = Some(to);
+                    self.refresh_panel();
+                }
+            }
+        }
+    }
+    fn on_mouse_up(&mut self, x: f32, y: f32) {
+        crate::drop::dlog(&format!(
+            "MouseUp ({x},{y}) offset={:?}",
+            self.renderer.offset
+        ));
+        if self.dock_drag.is_some() {
+            return;
+        }
+        let pressed = self.press_pt.take();
+        let consumed = self.press_consumed || self.drag_item.is_some();
+        let drag = self.drag_item.take().is_some();
+        unsafe {
+            let _ = KillTimer(Some(self.hwnd), TIMER_HOLD);
+            let _ = ReleaseCapture();
+        }
+        if drag {
+            self.save_items();
+        }
+        let mut clicked = false;
+        if let Some((px, py)) = pressed {
+            if !consumed
+                && (x - px).hypot(y - py) <= 8.0
+                && self.hit_at(px, py) == self.hit_at(x, y)
+            {
+                clicked = true;
+                self.on_click(x, y);
+            }
+        }
+        self.press_consumed = false;
+        // State-changing click handlers already redraw. Avoid rendering the same
+        // full-screen layered frame a second time for one mouse-up event.
+        if drag || !clicked {
+            self.redraw();
+        }
+    }
     /// 点击：命中测试与绘制严格一致（hit.rs，带单测），杜绝跨区域误触发
     fn on_click(&mut self, x: f32, y: f32) {
         let hit = hit::hit_test(
@@ -195,6 +588,7 @@ impl App {
             self.screen_h,
             self.expanded,
             self.scroll,
+            self.edit_mode,
             x,
             y,
         );
@@ -208,7 +602,14 @@ impl App {
                     .and_then(|q| q.items.get(index))
                     .cloned();
                 if let Some(item) = item {
-                    open::launch(&item.kind, &item.target);
+                    if self.edit_mode {
+                        return;
+                    }
+                    if let Err(e) = open::launch(&item.kind, &item.target) {
+                        self.status = Some((e, Instant::now()));
+                        self.redraw();
+                        return;
+                    }
                     if self.cfg.auto_collapse_after_open {
                         self.set_expanded(None);
                     }
@@ -218,12 +619,41 @@ impl App {
             hit::Hit::Quadrant(qi) => match self.expanded {
                 Some(cur) if cur == qi => self.set_expanded(None), // 再点同一象限 = 收起
                 Some(_) if self.cfg.switch_panel_on_click => self.set_expanded(Some(qi)), // 直接切换
-                Some(_) => self.set_expanded(None),               // 先收起（再点才展开）
+                Some(_) => self.set_expanded(None), // 先收起（再点才展开）
                 None => self.set_expanded(Some(qi)),
             },
-            // 中心 / 面板空白 / 弧缝空白：展开时点击 = 收起（保证"回得去"）
-            hit::Hit::Center | hit::Hit::PanelBlank | hit::Hit::None => {
-                if self.expanded.is_some() {
+            // 编辑态：点删除角标 → 删条目并写回配置
+            hit::Hit::ItemDelete { qi, index } => {
+                if self.cfg.remove_item(qi, index) {
+                    self.save_items();
+                    self.refresh_panel();
+                }
+            }
+            // 面板空白保留状态；独立关闭/整理按钮，中心退出整理或收起
+            hit::Hit::PanelClose => self.set_expanded(None),
+            hit::Hit::PanelEdit => {
+                self.edit_mode = !self.edit_mode;
+                self.sync_title();
+                self.redraw();
+            }
+            hit::Hit::PanelBlank => {}
+            hit::Hit::Center => {
+                if self.edit_mode {
+                    self.edit_mode = false;
+                    self.sync_title();
+                    self.redraw();
+                } else if self.expanded.is_some() {
+                    self.set_expanded(None);
+                } else {
+                    self.start_resource_cleanup();
+                }
+            }
+            hit::Hit::None => {
+                if self.edit_mode {
+                    self.edit_mode = false;
+                    self.sync_title();
+                    self.redraw();
+                } else if self.expanded.is_some() {
                     self.set_expanded(None);
                 }
             }
@@ -232,8 +662,20 @@ impl App {
 
     fn on_wheel(&mut self, delta: f32) {
         if let Some(qi) = self.expanded {
-            let items = self.cfg.quadrants.get(qi).map(|q| q.items.len()).unwrap_or(0);
-            let lay = render::layout_panel(&self.cfg, items, &self.geom, self.screen_w, self.screen_h, qi);
+            let items = self
+                .cfg
+                .quadrants
+                .get(qi)
+                .map(|q| q.items.len())
+                .unwrap_or(0);
+            let lay = render::layout_panel(
+                &self.cfg,
+                items,
+                &self.geom,
+                self.screen_w,
+                self.screen_h,
+                qi,
+            );
             if lay.scroll_max > 0.0 {
                 self.scroll = (self.scroll - delta * 0.35).clamp(0.0, lay.scroll_max);
                 self.redraw();
@@ -257,19 +699,94 @@ impl App {
             let _ = AppendMenuW(menu, MF_STRING, MENU_QUIT, PCWSTR(t3.as_ptr()));
             let mut p = POINT::default();
             let _ = GetCursorPos(&mut p);
-            let _ = TrackPopupMenu(menu, TPM_RIGHTBUTTON, p.x, p.y, None::<i32>, self.hwnd, None::<*const RECT>);
+            // A desktop-attached child cannot reliably activate a popup menu.
+            let owner = CreateWindowExW(
+                windows::Win32::UI::WindowsAndMessaging::WS_EX_TOOLWINDOW,
+                PCWSTR(crate::sys::wide("STATIC").as_ptr()),
+                PCWSTR::null(),
+                windows::Win32::UI::WindowsAndMessaging::WS_POPUP,
+                p.x,
+                p.y,
+                1,
+                1,
+                None,
+                None,
+                Some(deskpin::module_handle()),
+                None,
+            )
+            .unwrap_or(self.hwnd);
+            if owner != self.hwnd {
+                let _ = windows::Win32::UI::WindowsAndMessaging::ShowWindow(
+                    owner,
+                    windows::Win32::UI::WindowsAndMessaging::SW_SHOW,
+                );
+                let _ = windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(owner);
+            }
+            let command = TrackPopupMenu(
+                menu,
+                TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
+                p.x,
+                p.y,
+                None::<i32>,
+                owner,
+                None::<*const RECT>,
+            );
             let _ = DestroyMenu(menu);
+            if owner != self.hwnd {
+                let _ = DestroyWindow(owner);
+            }
+            // Open windows only after the menu releases capture and activation.
+            if command.0 != 0 {
+                let _ = PostMessageW(
+                    Some(self.hwnd),
+                    WM_COMMAND,
+                    WPARAM(command.0 as usize),
+                    LPARAM(0),
+                );
+            }
         }
     }
 
     fn reload_config(&mut self) {
+        // 显式加载磁盘配置时不把旧内存位置写回覆盖外部编辑。
+        self.dock_drag = None;
+        self.cancel_press();
         let (cfg, note) = Config::load();
         if !note.is_empty() {
             eprintln!("[ring-dock] {note}");
         }
         self.cfg = cfg;
         self.geom.n = self.cfg.quadrant_count;
+        self.restore_position();
         self.set_expanded(None);
+    }
+
+    /// 打开条目后自动收起面板
+    /// 拖放落点是否可接受：面板展开且落在面板内
+    pub(crate) fn drop_target_ok(&self, screen_x: f32, screen_y: f32) -> bool {
+        drop::point_in_panel(
+            &self.cfg,
+            &self.geom,
+            self.screen_w,
+            self.screen_h,
+            self.expanded,
+            self.origin,
+            screen_x,
+            screen_y,
+        )
+    }
+
+    /// 拖放收纳：加入当前展开象限 → 写回 config.json → 刷新面板
+    pub(crate) fn on_drop_files(&mut self, paths: &[String]) {
+        let qi = match self.expanded {
+            Some(q) => q,
+            None => return,
+        };
+        let added = drop::add_items(&mut self.cfg, qi, paths);
+        if added > 0 {
+            self.save_items();
+            self.refresh_panel(); // 刷新布局/命中/重绘（保留编辑态）
+        }
     }
 
     /// 打开设置窗口（托盘 / 右键菜单入口）
@@ -278,6 +795,9 @@ impl App {
             self.hwnd,
             self.cfg.switch_panel_on_click,
             self.cfg.auto_collapse_after_open,
+            self.cfg.icon_style,
+            self.cfg.category_display_mode,
+            &self.cfg.quadrants,
         );
     }
 
@@ -288,47 +808,87 @@ impl App {
         if (x, y) == self.origin && w as f32 == self.screen_w && h as f32 == self.screen_h {
             return;
         }
-        // 窗口整体挪动：旧位置交还桌面重绘（layered 合成，保险）
-        let old_win = RECT {
-            left: self.origin.0,
-            top: self.origin.1,
-            right: self.origin.0 + self.screen_w as i32,
-            bottom: self.origin.1 + self.screen_h as i32,
-        };
-        self.set_expanded(None);
+        self.finish_dock_drag();
+        self.cancel_press();
         self.origin = (x, y);
         self.screen_w = w as f32;
         self.screen_h = h as f32;
-        self.geom.cx = w as f32 / 2.0;
-        self.geom.cy = h as f32 / 2.0;
-        deskpin::place_workarea(self.hwnd);
-        deskpin::repaint_desktop_area(old_win);
+        self.restore_position();
+        self.set_expanded(None);
     }
 
     /// 挂载自愈（deskpin）：挂进桌面窗口树（固定显示在桌面上）；
     /// 失败退化为顶层压底（不遮挡应用窗口），定时器持续重试
     fn ensure_embedded(&mut self) {
+        if self.preview {
+            return;
+        }
         let before = self.pinner.mode();
         let after = self.pinner.maintain(self.hwnd);
         if before != Some(after) {
-            self.update_hit_rgn();
             self.redraw();
         }
+    }
+    fn register_drop(&mut self) {
+        let target: windows::Win32::System::Ole::IDropTarget = drop::DropTarget {
+            app: self as *mut App,
+            accepts_files: std::cell::Cell::new(false),
+        }
+        .into();
+        if let Err(e) = unsafe { windows::Win32::System::Ole::RegisterDragDrop(self.hwnd, &target) }
+        {
+            eprintln!("[ring-dock] RegisterDragDrop: {e}");
+        }
+    }
+    pub(crate) fn drag_over(&mut self, sx: f32, sy: f32) -> bool {
+        let x = sx - self.origin.0 as f32;
+        let y = sy - self.origin.1 as f32;
+        let h = self.hit_at(x, y);
+        if let hit::Hit::Quadrant(q) = h {
+            match self.drag_hover {
+                Some((old, start)) if old == q => {
+                    if start.elapsed().as_millis() >= 400 && self.expanded != Some(q) {
+                        self.set_expanded(Some(q));
+                    }
+                }
+                _ => self.drag_hover = Some((q, Instant::now())),
+            }
+        } else {
+            self.drag_hover = None;
+        }
+        let ok = self.drop_target_ok(sx, sy);
+        if ok != self.drop_hot || self.hover != h {
+            self.drop_hot = ok;
+            self.hover = h;
+            self.redraw();
+        }
+        ok
+    }
+    pub(crate) fn drag_leave(&mut self) {
+        self.drop_hot = false;
+        self.drag_hover = None;
+        self.hover = hit::Hit::None;
+        self.redraw();
     }
 
     /// 桌面宿主被销毁（Explorer 重启/换壁纸）会连带销毁桌面子窗口：换新窗口并重挂，不退出
     fn recreate_window(&mut self) {
-        match create_visual_window() {
+        match create_visual_window(self.preview) {
             Ok(hwnd) => {
                 self.hwnd = hwnd;
                 unsafe {
                     SetWindowLongPtrW(hwnd, GWLP_USERDATA, self as *mut App as isize);
                     SetTimer(Some(hwnd), TIMER_TICK, 500, None);
+                    SetTimer(Some(hwnd), TIMER_FRAME, FRAME_INTERVAL_MS, None);
                     let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
                 }
+                self.cancel_press();
+                self.animation = None;
+                self.panel_alpha = 1.0;
+                self.register_drop();
+                self.sync_title();
                 self.tray.readd(hwnd);
                 self.ensure_embedded();
-                self.update_hit_rgn();
                 self.redraw();
             }
             Err(e) => eprintln!("[ring-dock] 窗口重建失败：{e}"),
@@ -346,13 +906,13 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
                 let app = (*cs).lpCreateParams as *mut App;
                 SetWindowLongPtrW(hwnd, GWLP_USERDATA, app as isize);
             }
-            LRESULT(1)
+            DefWindowProcW(hwnd, msg, w, l)
         }
         WM_PAINT => {
             let mut ps = PAINTSTRUCT::default();
-            let hdc = BeginPaint(hwnd, &mut ps);
+            let _hdc = BeginPaint(hwnd, &mut ps);
             if !ptr.is_null() {
-                (*ptr).paint(hdc);
+                (*ptr).redraw();
             }
             let _ = EndPaint(hwnd, &ps);
             LRESULT(0)
@@ -361,43 +921,238 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
         WM_ERASEBKGND => LRESULT(1),
         WM_LBUTTONDOWN => {
             if !ptr.is_null() {
-                let x = (l.0 & 0xFFFF) as i16 as f32;
-                let y = ((l.0 >> 16) & 0xFFFF) as i16 as f32;
-                (*ptr).on_click(x, y);
+                let x = (l.0 & 0xFFFF) as i16 as f32 + (*ptr).renderer.offset.0 as f32;
+                let y = ((l.0 >> 16) & 0xFFFF) as i16 as f32 + (*ptr).renderer.offset.1 as f32;
+                (*ptr).on_mouse_down(x, y);
+            }
+            LRESULT(0)
+        }
+        WM_LBUTTONUP => {
+            if !ptr.is_null() {
+                let x = (l.0 & 0xFFFF) as i16 as f32 + (*ptr).renderer.offset.0 as f32;
+                let y = ((l.0 >> 16) & 0xFFFF) as i16 as f32 + (*ptr).renderer.offset.1 as f32;
+                (*ptr).on_mouse_up(x, y);
+            }
+            LRESULT(0)
+        }
+        WM_MBUTTONDOWN | WM_MBUTTONUP => {
+            if !ptr.is_null() {
+                let x = (l.0 & 0xFFFF) as i16 as f32 + (*ptr).renderer.offset.0 as f32;
+                let y = ((l.0 >> 16) & 0xFFFF) as i16 as f32 + (*ptr).renderer.offset.1 as f32;
+                if msg == WM_MBUTTONDOWN {
+                    (*ptr).on_middle_down(x, y);
+                } else {
+                    (*ptr).on_middle_up(x, y);
+                }
+            }
+            LRESULT(0)
+        }
+        WM_MOUSEMOVE => {
+            if !ptr.is_null() {
+                let x = (l.0 & 0xFFFF) as i16 as f32 + (*ptr).renderer.offset.0 as f32;
+                let y = ((l.0 >> 16) & 0xFFFF) as i16 as f32 + (*ptr).renderer.offset.1 as f32;
+                (*ptr).on_mouse_move(x, y);
+            }
+            LRESULT(0)
+        }
+        WM_MOUSELEAVE => {
+            if !ptr.is_null() {
+                (*ptr).hover = hit::Hit::None;
+                (*ptr).redraw();
+            }
+            LRESULT(0)
+        }
+        WM_CAPTURECHANGED => {
+            if !ptr.is_null() {
+                let app = &mut *ptr;
+                app.finish_dock_drag();
+                app.press_pt = None;
+                app.press_consumed = false;
+                if app.drag_item.take().is_some() {
+                    app.save_items();
+                }
+                let _ = KillTimer(Some(hwnd), TIMER_HOLD);
+            }
+            LRESULT(0)
+        }
+        WM_CANCELMODE => {
+            if !ptr.is_null() {
+                (*ptr).finish_dock_drag();
+                (*ptr).cancel_press();
+            }
+            LRESULT(0)
+        }
+        WM_SETCURSOR => {
+            if !ptr.is_null() {
+                let interactive = !matches!(
+                    (*ptr).hover,
+                    hit::Hit::None | hit::Hit::PanelBlank | hit::Hit::Center
+                );
+                let id = if (*ptr).dock_drag.is_some() {
+                    IDC_SIZEALL
+                } else if interactive {
+                    IDC_HAND
+                } else {
+                    IDC_ARROW
+                };
+                windows::Win32::UI::WindowsAndMessaging::SetCursor(LoadCursorW(None, id).ok());
+                return LRESULT(1);
+            }
+            DefWindowProcW(hwnd, msg, w, l)
+        }
+        WM_KEYDOWN if w.0 == 27 => {
+            if !ptr.is_null() {
+                (*ptr).set_expanded(None);
             }
             LRESULT(0)
         }
         WM_MOUSEWHEEL => {
-            if !ptr.is_null() {
+            if !ptr.is_null() && (*ptr).dock_drag.is_none() {
                 let delta = ((w.0 >> 16) & 0xFFFF) as i16 as f32;
                 (*ptr).on_wheel(delta);
             }
             LRESULT(0)
         }
         WM_RBUTTONUP => {
-            if !ptr.is_null() {
+            if !ptr.is_null() && (*ptr).dock_drag.is_none() {
                 (*ptr).popup_menu();
             }
             LRESULT(0)
         }
         WM_TIMER => {
+            if !ptr.is_null() && w.0 == TIMER_FRAME {
+                let app = &mut *ptr;
+                if app.resource_region_visible() {
+                    app.redraw();
+                }
+                return LRESULT(0);
+            }
+            if !ptr.is_null() && w.0 == TIMER_ANIMATE {
+                let app = &mut *ptr;
+                if let Some(start) = app.animation {
+                    let t = (start.elapsed().as_secs_f32() / 0.16).min(1.0);
+                    app.panel_alpha = 1.0 - (1.0 - t).powi(3);
+                    if t >= 1.0 {
+                        app.animation = None;
+                        let _ = KillTimer(Some(hwnd), TIMER_ANIMATE);
+                    }
+                    app.redraw();
+                }
+                return LRESULT(0);
+            }
+            if !ptr.is_null() && w.0 == TIMER_HOLD {
+                (*ptr).on_hold();
+                return LRESULT(0);
+            }
             if !ptr.is_null() && w.0 == TIMER_TICK {
                 let app = &mut *ptr;
                 app.tick = app.tick.wrapping_add(1);
-                if app.tick % 20 == 0 {
+                if app.tick.is_multiple_of(20) {
                     // 每 ~10s：工作区几何同步 + 挂载自愈（开销可忽略）
                     app.sync_geometry();
                     app.ensure_embedded();
                 }
-                if let Some(rc) = app.pending_repaint.take() {
-                    // 低频处理「交还桌面重绘」（点击路径零跨进程调用）
-                    deskpin::repaint_desktop_area(rc);
+                let stale_location = app.environment.as_ref().and_then(|weather| {
+                    (weather.updated_at.elapsed().as_secs() >= 1800).then_some(weather.location)
+                });
+                if let Some(location) = stale_location {
+                    app.start_weather_fetch(location);
                 }
-                let t = app.cfg.clock_text();
-                if t != app.last_clock {
-                    app.last_clock = t;
-                    app.redraw();
+                let region_visible = app.resource_region_visible();
+                if region_visible {
+                    let resumed = app.resources_paused;
+                    if resumed {
+                        app.resource_sampler.reset_cpu_baseline();
+                        SetTimer(Some(hwnd), TIMER_FRAME, FRAME_INTERVAL_MS, None);
+                    }
+                    let mut usage = app.resource_sampler.sample();
+                    if resumed {
+                        // Start a fresh CPU interval after the hidden period; keep the last
+                        // reading until the next sample instead of showing a misleading 0%.
+                        usage.cpu = app.resources.cpu;
+                    }
+                    let t = app.cfg.clock_text();
+                    let usage_changed = usage.cpu.round() != app.resources.cpu.round()
+                        || usage.memory.round() != app.resources.memory.round();
+                    if resumed || t != app.last_clock || usage_changed {
+                        app.last_clock = t;
+                        app.resources = usage;
+                        app.redraw();
+                    }
+                    app.resources_paused = false;
+                } else if !app.resources_paused {
+                    let _ = KillTimer(Some(hwnd), TIMER_FRAME);
+                    app.resource_sampler.reset_cpu_baseline();
+                    app.resources_paused = true;
                 }
+                if app
+                    .status
+                    .as_ref()
+                    .is_some_and(|s| s.1.elapsed().as_secs() > 4)
+                {
+                    app.status = None;
+                    if region_visible {
+                        app.redraw();
+                    }
+                }
+            }
+            LRESULT(0)
+        }
+        WM_CLEANUP_DONE => {
+            if !ptr.is_null() {
+                let app = &mut *ptr;
+                let message = app
+                    .cleanup_result
+                    .lock()
+                    .ok()
+                    .and_then(|mut result| result.take());
+                if let Some(message) = message {
+                    app.cleanup_running = false;
+                    app.status = Some((message, Instant::now()));
+                    if app.resource_region_visible() {
+                        app.redraw();
+                    }
+                }
+            }
+            LRESULT(0)
+        }
+        settings_ui::WM_REQUEST_ENVIRONMENT => {
+            if !ptr.is_null() {
+                (*ptr).request_system_location();
+            }
+            LRESULT(0)
+        }
+        WM_LOCATION_READY => {
+            if !ptr.is_null() && l.0 != 0 {
+                let result = Box::from_raw(l.0 as *mut Result<environment::SystemLocation, String>);
+                let app = &mut *ptr;
+                app.environment_refreshing = false;
+                match *result {
+                    Ok(location) => app.start_weather_fetch(location),
+                    Err(error) => {
+                        app.environment_status = error;
+                        app.redraw();
+                    }
+                }
+            }
+            LRESULT(0)
+        }
+        WM_ENVIRONMENT_READY => {
+            if !ptr.is_null() && l.0 != 0 {
+                let result =
+                    Box::from_raw(l.0 as *mut Result<environment::EnvironmentSnapshot, String>);
+                let app = &mut *ptr;
+                app.environment_refreshing = false;
+                match *result {
+                    Ok(weather) => {
+                        app.environment = Some(weather);
+                        app.environment_status = "天气已更新".into();
+                    }
+                    Err(error) => {
+                        app.environment_status = error;
+                    }
+                }
+                app.redraw();
             }
             LRESULT(0)
         }
@@ -408,6 +1163,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
                     MENU_RELOAD => (*ptr).reload_config(),
                     MENU_OPENCFG => open::open_config_file(),
                     MENU_QUIT => {
+                        (*ptr).finish_dock_drag();
                         (*ptr).tray.remove();
                         (*ptr).quitting = true;
                         let _ = DestroyWindow((*ptr).hwnd);
@@ -426,8 +1182,11 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
         WM_DESTROY => {
             if !ptr.is_null() && !(*ptr).quitting {
                 // 非用户退出（Explorer 重启/换壁纸连带销毁子窗口）→ 重建并重挂
-                (*ptr).recreate_window();
+                let _ = windows::Win32::System::Ole::RevokeDragDrop(hwnd);
+                (*ptr).hwnd = HWND::default();
+                let _ = PostMessageW(None, WM_RECREATE, WPARAM(0), LPARAM(0));
             } else {
+                let _ = windows::Win32::System::Ole::RevokeDragDrop(hwnd);
                 PostQuitMessage(0);
             }
             LRESULT(0)
@@ -458,15 +1217,36 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
     }
 }
 
-/// 创建可视窗口：WS_EX_LAYERED 统一透明度（一块半透明玻璃，命中按 Rgn 全域生效），
-/// 随后由 deskpin 挂进桌面窗口树；嵌入失败时保持顶层压底并定时重试
-fn create_visual_window() -> Result<HWND, String> {
+fn post_environment_result(hwnd: HWND, result: Result<environment::EnvironmentSnapshot, String>) {
+    let payload = Box::into_raw(Box::new(result));
+    let posted = unsafe {
+        PostMessageW(
+            Some(hwnd),
+            WM_ENVIRONMENT_READY,
+            WPARAM(0),
+            LPARAM(payload as isize),
+        )
+    };
+    if posted.is_err() {
+        unsafe { drop(Box::from_raw(payload)) };
+    }
+}
+
+/// 逐像素 alpha 窗口；生产模式挂桌面，显式预览模式才置顶用于隔离测试。
+fn create_visual_window(preview: bool) -> Result<HWND, String> {
     let class_visual = crate::sys::wide(CLASS_VISUAL);
     let title_v = crate::sys::wide("ring-dock");
     let hinst = windows::Win32::Foundation::HINSTANCE(deskpin::module_handle().0);
     unsafe {
         let hwnd = CreateWindowExW(
-            WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            WS_EX_LAYERED
+                | WS_EX_TOOLWINDOW
+                | WS_EX_NOACTIVATE
+                | if preview {
+                    WS_EX_TOPMOST
+                } else {
+                    Default::default()
+                },
             PCWSTR(class_visual.as_ptr()),
             PCWSTR(title_v.as_ptr()),
             WS_POPUP,
@@ -480,12 +1260,14 @@ fn create_visual_window() -> Result<HWND, String> {
             Some(std::ptr::null::<c_void>()),
         )
         .map_err(|e| format!("窗口创建失败：{e:?}"))?;
-        // 不用 WS_EX_LAYERED：layered 窗口的鼠标命中按"像素透明度"算，实测极难点中。
-        // 普通窗口 + SetWindowRgn：Rgn 内全域可命中，视觉=不透明深色玻璃块。
         Ok(hwnd)
     }
 }
-fn register_class(name: &str, brush: Option<HBRUSH>, proc: unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT) -> Result<(), String> {
+fn register_class(
+    name: &str,
+    brush: Option<HBRUSH>,
+    proc: unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT,
+) -> Result<(), String> {
     let cname = crate::sys::wide(name);
     unsafe {
         let wc = WNDCLASSW {
@@ -500,13 +1282,23 @@ fn register_class(name: &str, brush: Option<HBRUSH>, proc: unsafe extern "system
         let atom = RegisterClassW(&wc);
         if atom == 0 {
             let err = windows::Win32::Foundation::GetLastError();
-            return Err(format!("RegisterClassW({name}) 失败，GetLastError={:?}", err));
+            return Err(format!(
+                "RegisterClassW({name}) 失败，GetLastError={:?}",
+                err
+            ));
         }
     }
     Ok(())
 }
 
 fn main() {
+    if let Some(result) = cleanup::run_memory_broker_mode() {
+        if let Err(error) = result {
+            eprintln!("[ring-dock broker] {error}");
+        }
+        return;
+    }
+
     deskpin::enable_dpi_awareness();
     let (ox, oy, w, h) = deskpin::work_area();
 
@@ -515,22 +1307,44 @@ fn main() {
         eprintln!("[ring-dock] {note}");
     }
 
+    let preview = std::env::args().any(|arg| arg == "--preview");
+    let broker_result = if preview {
+        Ok(None)
+    } else {
+        cleanup::find_win_memory_cleaner(cfg.win_memory_cleaner_path.as_deref())
+            .and_then(|executable| cleanup::start_memory_broker(&executable))
+            .map(Some)
+    };
+    let (memory_broker, startup_status) = match broker_result {
+        Ok(broker) => (
+            broker,
+            Some(("内存清理助手已就绪".to_string(), Instant::now())),
+        ),
+        Err(error) => (
+            None,
+            Some((format!("内存清理助手未就绪：{error}"), Instant::now())),
+        ),
+    };
+
     let renderer = Renderer::new().expect("Direct2D 初始化失败");
 
     unsafe {
-        // 类背景 = 色键黑（WS_EX_LAYERED 色键透明：黑像素=完全透明，其余像素×alpha 半透明）
-        let key_brush = CreateSolidBrush(COLORREF(0x000000));
-        register_class(CLASS_VISUAL, Some(key_brush), wnd_proc).expect("窗口类注册失败");
-
-        let hwnd = create_visual_window().unwrap_or_else(|e| {
+        register_class(CLASS_VISUAL, None, wnd_proc).expect("窗口类注册失败");
+        let hwnd = create_visual_window(preview).unwrap_or_else(|e| {
             eprintln!("[ring-dock] {e}");
             std::process::exit(1);
         });
-        // 形状即透明：SetWindowRgn 之外的区域不存在（无需 layered/色键）
+        // Transparent pixels are both visually empty and input-pass-through.
 
         let mut app_box = Box::new(App {
             cfg,
-            geom: RingGeom { cx: w as f32 / 2.0, cy: h as f32 / 2.0, r_mid: 117.0, stroke: 26.0, n: 4 },
+            geom: RingGeom {
+                cx: w as f32 / 2.0,
+                cy: h as f32 * 0.40,
+                r_mid: 136.0,
+                stroke: 44.0,
+                n: 4,
+            },
             origin: (ox, oy),
             screen_w: w as f32,
             screen_h: h as f32,
@@ -539,33 +1353,80 @@ fn main() {
             renderer,
             hwnd,
             last_clock: String::new(),
+            environment: None,
+            environment_status: "正在尝试读取系统位置".into(),
+            environment_refreshing: false,
+            animation_origin: Instant::now(),
+            resources: crate::sys::ResourceUsage::default(),
+            resource_sampler: crate::sys::ResourceSampler::default(),
+            resources_paused: false,
             quitting: false,
+            edit_mode: false,
+            press_pt: None,
+            press_consumed: false,
+            drag_item: None,
+            dock_drag: None,
             tick: 0,
             pinner: deskpin::Pinner::new(),
             tray: tray::Tray::add(hwnd, "ring-dock", 1),
             msg_taskbar: tray::taskbar_created_msg(),
-            pending_repaint: None,
+            hover: hit::Hit::None,
+            panel_alpha: 1.0,
+            animation: None,
+            drop_hot: false,
+            drag_hover: None,
+            status: startup_status,
+            cleanup_running: false,
+            cleanup_result: Arc::new(Mutex::new(None)),
+            memory_broker,
+            preview,
         });
         app_box.geom.n = app_box.cfg.quadrant_count;
+        app_box.restore_position();
         let app_ptr: *mut App = &mut *app_box;
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, app_ptr as isize);
 
-        (*app_ptr).update_hit_rgn();
         (*app_ptr).last_clock = (*app_ptr).cfg.clock_text();
+        (*app_ptr).resources = (*app_ptr).resource_sampler.sample();
+        let winrt = windows::Win32::System::WinRT::RoInitialize(
+            windows::Win32::System::WinRT::RO_INIT_SINGLETHREADED,
+        );
+        if let Err(ref error) = winrt {
+            eprintln!("[ring-dock] Windows Runtime 初始化失败：{error}");
+        }
+        let ole = windows::Win32::System::Ole::OleInitialize(None);
+        if ole.is_ok() {
+            (*app_ptr).register_drop();
+        } else {
+            eprintln!("[ring-dock] OLE 初始化失败：{ole:?}");
+        }
         // 挂进桌面窗口树（固定显示在桌面上）；失败退回顶层压底 Z 序，定时器里持续重试
         (*app_ptr).ensure_embedded();
+        (*app_ptr).sync_title();
         (*app_ptr).redraw();
 
-        // 显示但不抢焦点；SetWindowRgn 形状外完全不存在 → 不拦截任何鼠标/滚动
+        // Display without stealing focus. Alpha zero passes through to the desktop.
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
 
         SetTimer(Some(hwnd), TIMER_TICK, 500, None);
+        SetTimer(Some(hwnd), TIMER_FRAME, FRAME_INTERVAL_MS, None);
+        (*app_ptr).start_initial_environment_lookup();
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+            if msg.hwnd.is_invalid() && msg.message == WM_RECREATE {
+                (*app_ptr).recreate_window();
+                continue;
+            }
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
-        drop(Box::from_raw(app_ptr));
+        if ole.is_ok() {
+            windows::Win32::System::Ole::OleUninitialize();
+        }
+        if winrt.is_ok() {
+            windows::Win32::System::WinRT::RoUninitialize();
+        }
+        // app_box owns App; reconstructing another Box here would double-free it.
     }
 }

@@ -9,6 +9,7 @@ public class I {
   [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc cb, IntPtr l);
   [DllImport("user32.dll")] static extern bool EnumChildWindows(IntPtr p, EnumProc cb, IntPtr l);
   [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern int GetClassNameW(IntPtr h, StringBuilder s, int m);
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern int GetWindowTextW(IntPtr h, StringBuilder s, int m);
   [DllImport("user32.dll")] public static extern IntPtr SendMessageW(IntPtr h, uint m, IntPtr w, IntPtr l);
   [DllImport("user32.dll")] public static extern bool PostMessageW(IntPtr h, uint m, IntPtr w, IntPtr l);
   [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr h);
@@ -18,6 +19,14 @@ public class I {
   [DllImport("gdi32.dll")]  static extern uint GetRegionData(IntPtr rgn, uint count, byte[] buf);
   [DllImport("user32.dll")] static extern bool SystemParametersInfoW(uint a, uint b, out RECT rc, uint f);
   public struct RECT { public int left, top, right, bottom; }
+
+  // 展开状态观测：标题带 #expanded=N（小面板落在圆盘内时 Rgn 面积不变，面积法失效）
+  public static string StateOf(IntPtr h) {
+    var sb = new StringBuilder(256); GetWindowTextW(h, sb, 256);
+    string t = sb.ToString();
+    int i = t.IndexOf("#expanded=");
+    return i < 0 ? "-" : t.Substring(i + 10);
+  }
 
   public static string ClassOf(IntPtr h) { var sb = new StringBuilder(256); GetClassNameW(h, sb, 256); return sb.ToString(); }
   public static IntPtr FindAny(string cls) {
@@ -76,6 +85,11 @@ function AssertNotEq($actual, $bad, $name) {
   if ($actual -eq $bad) { Fail "$name（不应为 $bad）" }
   Write-Host "[PASS] $name"
 }
+function AssertState($expected, $name) {
+  $actual = [I]::StateOf($h)
+  if ($actual -ne $expected) { Fail "$name`n       期望展开=$expected`n       实际=$actual" }
+  Write-Host "[PASS] $name"
+}
 
 $cfgPath = "E:\tools\ring-dock\target\release\config.json"
 $script:proc = Start-Process -FilePath "E:\tools\ring-dock\target\release\ring-dock.exe" -PassThru
@@ -92,7 +106,7 @@ $rMid = 117.0
 $arc0x = [int]($cx + $rMid * [Math]::Cos(-45 * [Math]::PI / 180)); $arc0y = [int]($cy + $rMid * [Math]::Sin(-45 * [Math]::PI / 180))
 $arc1x = [int]($cx + $rMid * [Math]::Cos( 45 * [Math]::PI / 180)); $arc1y = [int]($cy + $rMid * [Math]::Sin( 45 * [Math]::PI / 180))
 $gapX  = $cx + $rMid; $gapY = $cy                    # 弧缝（0° 方向，视觉空白）
-$panelBlank0x = $cx + 455; $panelBlank0y = $cy - 155  # 面板0（右上，圆环外展开）内空白
+$panelBlank0x = $cx + 312; $panelBlank0y = $cy - 100   # 面板0（圆心锚点、右上展开）内空白
 
 Start-Sleep -Milliseconds 300
 $base = [I]::RgnInfo($h)
@@ -105,11 +119,12 @@ AssertEq ([I]::RgnInfo($h)) $base "弧缝点击不触发展开（回归：旧版
 # 2. 点弧 0 → 展开面板 0
 [I]::Click($h, $arc0x, $arc0y); Start-Sleep -Milliseconds 500
 $open0 = [I]::RgnInfo($h)
-AssertNotEq $open0 $base "点弧 0 展开面板"
+Write-Host "[Rgn] 展开0=$open0"
+AssertState "0" "点弧 0 展开面板"
 
 # 3. 再点弧 0 → 收起
 [I]::Click($h, $arc0x, $arc0y); Start-Sleep -Milliseconds 500
-AssertEq ([I]::RgnInfo($h)) $base "再点同一象限收起"
+AssertState "-" "再点同一象限收起"
 
 # 显式设定前提：switch_panel_on_click=true（此前失败的运行可能把 false 留在配置里）
 $cfg = Get-Content $cfgPath -Raw | ConvertFrom-Json
@@ -129,19 +144,19 @@ Start-Sleep -Milliseconds 500
 $open0 = [I]::RgnInfo($h)
 [I]::Click($h, $arc1x, $arc1y); Start-Sleep -Milliseconds 500
 $open1 = [I]::RgnInfo($h)
-AssertNotEq $open1 $base "true 档：展开 0 后点弧 1 → 切换（保持展开）"
-AssertNotEq $open1 $open0 "true 档：切换后面板变为面板 1"
+Write-Host "[Rgn] 切换后=$open1（面板1小、落在圆盘内，Rgn 面积可不变）"
+AssertState "1" "true 档：展开 0 后点弧 1 → 切换到面板 1（保持展开）"
 
 # 5. 面板空白点击 → 收起（\"回得去\"）
 [I]::Click($h, $arc0x, $arc0y); Start-Sleep -Milliseconds 500   # 切回面板 0（大面板）
 $Ignored = [I]::RgnInfo($h)
 [I]::Click($h, $panelBlank0x, $panelBlank0y); Start-Sleep -Milliseconds 500
-AssertEq ([I]::RgnInfo($h)) $base "面板空白点击收起"
+AssertState "-" "面板空白点击收起"
 
 # 6. 展开后点中心 → 收起
 [I]::Click($h, $arc0x, $arc0y); Start-Sleep -Milliseconds 500
 [I]::Click($h, $cx, $cy); Start-Sleep -Milliseconds 500
-AssertEq ([I]::RgnInfo($h)) $base "中心点击收起"
+AssertState "-" "中心点击收起"
 
 # 7. switch_panel_on_click=false：展开 0 后点弧 1 → 收起（不切换）
 $cfg = Get-Content $cfgPath -Raw | ConvertFrom-Json
@@ -156,9 +171,9 @@ $cfg | ConvertTo-Json -Depth 10 | Set-Content $cfgPath -Encoding UTF8
 [I]::PostMessageW($h, 0x0111, [IntPtr]101, [IntPtr]0) | Out-Null   # WM_COMMAND MENU_RELOAD
 Start-Sleep -Milliseconds 500
 [I]::Click($h, $arc0x, $arc0y); Start-Sleep -Milliseconds 500
-AssertNotEq ([I]::RgnInfo($h)) $base "false 档：点弧 0 展开"
+AssertState "0" "false 档：点弧 0 展开"
 [I]::Click($h, $arc1x, $arc1y); Start-Sleep -Milliseconds 500
-AssertEq ([I]::RgnInfo($h)) $base "false 档：点弧 1 先收起（不切换）"
+AssertState "-" "false 档：点弧 1 先收起（不切换）"
 
 # 8. 设置窗口：打开 → 存在 → 保存 → 关闭 → 配置落盘
 [I]::PostMessageW($h, 0x0111, [IntPtr]104, [IntPtr]0) | Out-Null   # WM_COMMAND MENU_SETTINGS

@@ -1,5 +1,6 @@
 //! 系统托盘图标（业务侧）：常驻托盘、点击弹菜单、Explorer 重启后自动重建
 use crate::sys::wide;
+use windows::core::PCWSTR;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
@@ -7,7 +8,6 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::{
     LoadIconW, RegisterWindowMessageW, HICON, IDI_APPLICATION, WM_APP,
 };
-use windows::core::PCWSTR;
 
 /// 托盘回调消息（发给宿主窗口；lparam 低字 = 鼠标消息）
 pub const WM_TRAY: u32 = WM_APP + 1;

@@ -47,6 +47,8 @@ dependencies = [
  "serde",
  "serde_json",
  "windows",
+ "windows-core",
+ "windows-future",
  "windows-numerics",
  "winres",
 ]

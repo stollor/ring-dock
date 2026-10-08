@@ -2,15 +2,15 @@
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
-pub fn launch(kind: &str, target: &str) {
+pub fn launch(kind: &str, target: &str) -> Result<(), String> {
     if target.is_empty() {
-        return;
+        return Err("目标为空，请检查配置".into());
     }
     let _ = kind; // url / program / file / folder 统一 open（系统按协议分发）
     unsafe {
         let verb = crate::sys::wide("open");
         let tgt = crate::sys::wide(target);
-        ShellExecuteW(
+        let result = ShellExecuteW(
             None,
             windows::core::PCWSTR(verb.as_ptr()),
             windows::core::PCWSTR(tgt.as_ptr()),
@@ -18,10 +18,14 @@ pub fn launch(kind: &str, target: &str) {
             None,
             SW_SHOWNORMAL,
         );
+        if result.0 as isize <= 32 {
+            return Err(format!("无法打开目标（错误 {}）", result.0 as isize));
+        }
     }
+    Ok(())
 }
 
 pub fn open_config_file() {
     let p = crate::config::Config::path();
-    launch("file", &p.to_string_lossy());
+    let _ = launch("file", &p.to_string_lossy());
 }

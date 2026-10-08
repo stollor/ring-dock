@@ -1,48 +1,70 @@
-//! # deskpin —— Windows 桌面挂载工具（无业务渲染）
+//! # deskpin —— Windows 桌面挂件「固定显示在桌面上」工具箱（无业务）
 //!
-//! 当前实现以 `SetParent` 尝试挂入 Explorer 的桌面窗口树，失败时使用顶层
-//! `HWND_BOTTOM` 降级；`maintain` 低频检查宿主并重试。业务仍负责绘制与窗口生命周期。
+//! 解决桌面挂件（贴图 / 时钟 / 圆环收纳 …）的两个刚需：
+//! 1. **不遮挡别的窗口**：挂在所有应用窗口之下；
+//! 2. **不受最小化影响**：Win+D「显示桌面」/「最小化所有」/ 任务栏右键最小化都不带走它。
 //!
-//! 桌面窗口树与私有 WorkerW 消息属于 Shell 实现细节，不能承诺所有 Windows 版本、
-//! 壁纸工具、Win+D 或 Explorer 重启组合行为一致。本项目本轮只实测了目标系统的
-//! SysListView32 挂载及自身窗口销毁后重建，没有主动触发 Win+D / Explorer 重启。
+//! ## 原理（调研结论）
 //!
-//! ## 用法
+//! Windows 没有任何样式位能让**顶层窗口**同时满足上述两点：
+//! `WS_EX_TOPMOST` 置顶会盖住所有应用、且 Win+D 照样把它最小化；
+//! Rainmeter 一类方案靠 `EVENT_SYSTEM_FOREGROUND` 钩子 + 定时器持续压 Z 序（会偶发失效）。
+//!
+//! 动态壁纸 / 桌面贴图类工具（Lively Wallpaper、AutoIt 贴图脚本、Electron 桌面挂件）
+//! 的通行做法是 **`SetParent` 挂进桌面窗口树**，让挂件成为桌面子窗口：
+//! - 天然位于所有应用之下；
+//! - 不属于顶层窗口，Win+D / 最小化所有只作用于 Progman 之外的普通应用窗口。
+//!
+//! ## 用法（业务侧只需三步）
 //!
 //! ```ignore
+//! // 1) 进程启动时启用 DPI 感知（物理像素坐标）
 //! deskpin::enable_dpi_awareness();
+//!
+//! // 2) 创建普通 WS_POPUP 窗口后挂载（幂等；失败自动退化为顶层压底并可稍后重试）
 //! let mut pinner = deskpin::Pinner::new();
 //! pinner.attach(hwnd);
-//! // 在业务低频定时器内维护，而非每帧重新挂载。
+//!
+//! // 3) 在自己的定时器里低频维护（建议 5~10 秒一次：挂载自愈 + Z 序拉回兄弟栈顶）
 //! pinner.maintain(hwnd);
 //! ```
 //!
-//! ## 生命周期
+//! ## 业务侧需要处理的一件事
 //!
-//! 若桌面宿主变化导致业务窗口销毁，业务应安排主消息循环在销毁回调返回后
-//! 重建窗口，再 attach；不要在 WM_DESTROY 里递归创建或释放仍被主循环拥有的 App。
+//! Explorer 重启 / 切换壁纸会**连带销毁**桌面子窗口。业务方应在 `WM_DESTROY`
+//! （非用户主动退出时）**重建窗口**再 `attach`，而不是退出进程：
 //!
 //! ```ignore
 //! WM_DESTROY => {
-//!     if quitting {
-//!         PostQuitMessage(0);
+//!     if !quitting {
+//!         hwnd = create_window();     // 业务重建
+//!         pinner.attach(hwnd);        // 重新挂载
 //!     } else {
-//!         PostThreadMessageW(ui_thread_id, WM_RECREATE, WPARAM(0), LPARAM(0));
+//!         PostQuitMessage(0);
 //!     }
 //! }
-//! // 主消息循环收到 WM_RECREATE 后创建新窗口并调用 pinner.attach(hwnd)。
 //! ```
 //!
-//! ## 挂载点降级链
+//! ## 挂载点降级链（`find_desktop_host`）
 //!
 //! ```text
-//! SysListView32 → SHELLDLL_DefView → Progman 子级 WorkerW
-//!     → 顶层 WorkerW → Progman → 顶层 HWND_BOTTOM
+//! SysListView32（桌面图标列表，圆环显示在图标之上）
+//!   → SHELLDLL_DefView（图标层）
+//!   → Progman 子级 WorkerW（图标之下、壁纸之上，Win11 24H2 起的层级）
+//!   → 顶层 WorkerW（Win10 壁纸层，0x052C 触发创建）
+//!   → Progman（兜底）
 //! ```
 //!
-//! 按实际窗口树探测，而非仅根据系统版本名假定宿主存在。
-//! `work_area` 当前只取主屏工作区；多屏 / 混合 DPI 需额外验证。
-//! 非激活桌面窗口接收滚轮还受系统非活动窗口滚动设置影响。
+//! 全部失败时退化为**顶层窗口压底 `HWND_BOTTOM`**（仍不遮挡应用；此档位才可能被
+//! Win+D 带走），并在下次 `maintain` 时自动重试嵌入。
+//!
+//! ## 已知边界
+//!
+//! - Win11 若在「系统属性 → 性能选项」关闭了「动画控件和元素」，Explorer 不创建
+//!   WorkerW（仅影响「图标之下」档位；图标层档位不受影响）。
+//! - `work_area` 取主屏工作区；多屏需求可自行扩展。
+//! - 挂件若需要鼠标滚轮：桌面子窗口无焦点，依赖系统「悬停时滚动非活动窗口」
+//!   （Win10/11 默认开启）。
 
 use windows::core::{BOOL, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT, WPARAM};
@@ -98,27 +120,6 @@ pub fn work_area() -> (i32, i32, i32, i32) {
 /// 把窗口摆到主屏工作区（已挂进桌面树时自动换算为父客户区坐标）
 pub fn place_workarea(hwnd: HWND) {
     let (x, y, w, h) = work_area();
-    place_screen_rect(hwnd, x, y, w, h);
-}
-
-/// Position a compact widget rectangle relative to the main work area.
-pub fn place_rect(hwnd: HWND, left: i32, top: i32, w: i32, h: i32) {
-    let (x, y, _, _) = work_area();
-    place_screen_rect(hwnd, x + left, y + top, w, h);
-}
-
-fn place_screen_rect(hwnd: HWND, x: i32, y: i32, w: i32, h: i32) {
-    let mut current = RECT::default();
-    if unsafe { windows::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut current) }.is_ok()
-        && (
-            current.left,
-            current.top,
-            current.right - current.left,
-            current.bottom - current.top,
-        ) == (x, y, w, h)
-    {
-        return;
-    }
     let (mut px, mut py) = (x, y);
     unsafe {
         if let Ok(p) = GetParent(hwnd) {
@@ -138,10 +139,47 @@ fn place_screen_rect(hwnd: HWND, x: i32, y: i32, w: i32, h: i32) {
 /// 触发 Explorer 创建 WorkerW 的私有消息（Win10 壁纸层；Win11 24H2 起层级收进 Progman）
 const WM_SPAWN_WORKERW: u32 = 0x052C;
 
+/// 把一块屏幕区域「交还」给桌面重绘（挂件自擦保险）。
+///
+/// 桌面子窗口的通病：`SetWindowRgn` 缩小（如收起面板）后，暴露出来的像素**没有人自动擦**——
+/// Explorer 的桌面平时静态不重绘，残影会一直留在屏幕上。调用本函数让桌面树
+///（壁纸 + 图标层 + 其子窗口）重绘该矩形，露出真实桌面。参数为屏幕坐标矩形（物理像素）。
+pub fn repaint_desktop_area(rect_screen: RECT) {
+    use windows::Win32::Graphics::Gdi::{RedrawWindow, RDW_ALLCHILDREN, RDW_INVALIDATE};
+    unsafe {
+        let shell = GetShellWindow(); // Progman（桌面树根）
+        if shell.is_invalid() {
+            return;
+        }
+        // RedrawWindow 的矩形是目标窗口客户区坐标
+        let mut pt = POINT {
+            x: rect_screen.left,
+            y: rect_screen.top,
+        };
+        let _ = ScreenToClient(shell, &mut pt);
+        let rc = RECT {
+            left: pt.x,
+            top: pt.y,
+            right: pt.x + (rect_screen.right - rect_screen.left),
+            bottom: pt.y + (rect_screen.bottom - rect_screen.top),
+        };
+        // 只重绘该矩形内的桌面树（壁纸 + 图标 + 挂件自身）。注意：
+        // **不加 RDW_UPDATENOW**——同步重绘是跨进程等待 Explorer，而 Explorer 重绘
+        // 桌面树时又可能等待本窗口的 WM_PAINT，存在阻塞/死锁风险；异步请求即可，
+        // 视觉正确性由 blit_snapshot 保证，这里只是「请桌面换回真身」的尽力而为。
+        let _ = RedrawWindow(
+            Some(shell),
+            Some(&rc),
+            None,
+            RDW_INVALIDATE | RDW_ALLCHILDREN,
+        );
+    }
+}
+
 /// 挂载方式
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PinMode {
-    /// 已挂进桌面窗口树；具体 Shell 行为仍须在目标环境验证
+    /// 已挂进桌面窗口树（推荐档）：不遮挡应用、不受 Win+D / 最小化影响
     Embedded,
     /// 降级档：顶层窗口压底 Z 序（仍不遮挡应用，但可能被 Win+D 带走）
     BottomFallback,

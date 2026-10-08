@@ -1,141 +1,109 @@
-# ring-dock —— Windows 桌面圆环收纳工具（Rust 初版）
+# Ring Dock · Orbit Glass
 
-> **接手/开新会话请先读 [`HANDOFF.md`](HANDOFF.md)**（项目现状、架构、经验坑案、回归测试手册）。
-> 本文偏功能与调研；HANDOFF 偏工程交接。
+Windows 桌面圆环收纳工具。当前界面使用真正的逐像素透明：暗色玻璃、四色细线光轨、清晰时钟与下置收藏面板。
 
-半透明圆环常驻屏幕中心（类似游戏表情盘），按象限收纳桌面图标；点击象限展开毛玻璃面板后点图标打开，平时点击穿透、不打扰。
+## 当前渲染与设计
 
-## 视觉与实现对照（线稿 → 代码）
+- `Direct2D / DirectWrite → 32-bit 预乘 BGRA DIB → UpdateLayeredWindow(ULW_ALPHA)`。
+- 桌面宿主由独立 `deskpin` 库管理；生产窗口嵌入桌面，**不置顶盖住应用**。
+- 背景半透明，文字主体不随玻璃透明度一起变淡；DirectWrite 使用灰度抗锯齿，避免透明表面的 ClearType 彩边。
+- 不抓壁纸、不缓存屏幕充当背景、不使用色键、文字区域挖洞或 `SetWindowRgn`。
+- 当前是透明玻璃视觉，**不是 Acrylic / 实时背景模糊**。不要把半透明和毛玻璃模糊混为一谈。
+- 圆环保持可用；下方独立面板包含整理/完成、关闭、滚动条、空状态、拖放/启动错误提示。
+- 展开有 160ms 淡入，结束停止动画定时器。没有常驻高频动画。
+- 绘制缓冲与透明窗口只覆盖圆环及展开面板的边界，收起即释放大缓冲。可见时环境动画最高约 15 FPS，被前台窗口完全遮挡时停止动画定时器；160ms 展开动画独立运行。原图标按可见行加载，缓存上限 128 项，切换分类、样式或删除收藏会淘汰旧资源；提取结果队列上限 32，同一时间只有一批提取任务。
 
-| 线稿口径 | 实现 |
+## 操作
+
+| 操作 | 结果 |
 |---|---|
-| 覆盖层叠在壁纸上，只存引用路径 | 桌面树嵌入的覆盖层；`config.json` 保存目标引用，不移动/复制真实文件 |
-| 未点击 = 点击穿透 | 单窗口 + `SetWindowRgn` 只保留「圆盘 ∪ 面板」，形状外天然穿透、不拦截 |
-| 视觉：深夜玻璃 + 冰蓝强调（全矢量） | 渐变弧段（圆头描边）+ 端点帽 + 玻璃徽章 + 中心时钟/日期；玻璃面板卡（模糊底 + 墨色压暗 + 顶部反光 + 边缘高光）+ 图标卡渐变 + 矢量图标 |
-| 圆环均分象限（默认 4，可配） | `quadrant_count`（2~8），弧段圆帽描边、段间留缝 |
-| 每象限一个类型图标 | program / file / folder / url 四类**矢量图标**（Direct2D 几何，无图片素材） |
-| 中心时钟（内容可配） | DirectWrite 文本，`clock_format`：%H:%M / %H:%M:%S / %I:%M %p |
-| 展开：该象限弧段消失让位 | 绘制时跳过展开象限弧段；面板一角紧贴圆心朝象限展开 |
-| 渐变毛玻璃面板（圆心侧朦胧→边缘清晰） | 展开瞬间抓桌面快照 → CPU 3 轮盒式模糊缓存 → 径向渐变透明度混合（圆心侧模糊浓、边缘归零露出实时桌面） |
-| 无边框/无标题栏，纯图标排布 | 无任何窗口装饰，只有柔光背景 + 图标格（白圆角块+矢量图形+名称） |
-| 同类同一横排、超长换排 | `max_columns` 列换排 |
-| 默认无滚动条，内容超多才浮现 | `scroll_max > 0` 时才绘制滚动条；滚轮/拖动内滚 |
-| 面板不超出屏幕 | `max_height_ratio` 上限 + 防御性夹取 |
-| 低资源 | 消息驱动零轮询；时钟文本无变化不重绘；模糊只在展开时算一次 |
+| 点分类弧片 | 展开；再点相同分类收起 |
+| 展开时点其他分类 | 按设置切换分类，或先收起 |
+| 点中心 / 面板 × | 整理态退出整理；面板展开时中心收起；圆环收起时点中心清理旧临时文件并请求低优先级内存整理；× 直接收起 |
+| 点面板空白 | 保持打开，不误关闭 |
+| 点收藏 | 正常模式打开目标；失败保留面板并提示 |
+| 点「整理」或长按面板 550ms | 进入整理；拖动换位，点 − 移除收藏（不删除原文件） |
+| 按住鼠标中键（滚轮）拖动 | 从圆环或面板任意可见位置移动整个挂件；松开保存位置，重启恢复 |
+| 滚轮 | 超长内容内部滚动；中键移动过程中暂不滚动 |
+| 拖文件经过分类 400ms | 自动展开该分类；移到面板松开，加入并保存 |
+| 重复拖入同一路径 | 忽略重复项 |
+| 右键圆环 / 托盘 | 设置、重载、打开配置、退出 |
 
-## 固定显示在桌面上：调研与实现
+完全透明区域交给下层桌面处理，所以**不承诺在任意外部位置点击都能关闭面板**。窗口不抢键盘焦点，当前不把全局 Esc 当作已完成能力。
 
-需求：常驻桌面、**不遮挡任何应用窗口**、**不受 Win+D /「最小化所有」影响**。
+拖放是收藏路径，不搬移原文件。接受 `CF_HDROP` 且源允许 COPY；不接受仅允许 MOVE 的源或纯文本源。`.lnk` / `.url` 使用 ShellExecute 打开。
 
-| 方案 | 代表 | 不遮挡 | 抗最小化 | 备注 |
-|---|---|---|---|---|
-| `WS_EX_TOPMOST` 顶层置顶 | 早期本项目 | ✗ 盖住所有应用 | ✗ Win+D 照样最小化 | 两个需求都不满足，已弃用 |
-| Z 序动态维护 | [Rainmeter `AlwaysOnTop=-2`](https://github.com/rainmeter/rainmeter/issues/339) | ✓ | ✓ | 需 `EVENT_SYSTEM_FOREGROUND` 钩子 + 定时器持续压 Z 序，官方承认偶发乱序失效 |
-| **SetParent 挂进桌面窗口树** | Lively Wallpaper、AutoIt 桌面贴图、Electron 桌面挂件方案 | ✓ | ✓ | 作为桌面子窗口：不属于顶层窗口，Win+D/最小化所有只动 Progman 之外的普通窗口；零轮询 |
+## 配置
 
-本项目采用**桌面窗口树嵌入**，能力已抽成独立 crate **`crates/deskpin`**（零业务、可直接复用），
-挂载点降级链（`deskpin::find_desktop_host`）：
+默认读取 exe 同目录 `config.json`；字段兼容旧配置。保存采用同目录临时文件、flush/sync 和 Windows 原子替换。保存错误在面板提示，不静默伪装成功。
 
-```
-SysListView32（图标之上）→ SHELLDLL_DefView → Progman 子级 WorkerW（图标之下，Win11 24H2 起）
-→ 顶层 WorkerW（Win10 壁纸层，0x052C 触发创建）→ Progman（兜底）
-```
+支持 2–8 分类、透明度、三种时钟格式、图标大小、间距、列数、滚动高度、切换分类及启动后收起偏好。设置中的“圆环分类显示”可选只显示图标、只显示沿圆弧排布的文字，或同时显示图标和文字；“各分类图标”可单独选择自动语义图标、对话气泡、代码、AI 星芒、播放按钮、程序窗口、文件、文件夹或网址图标。旧配置默认使用图标和文字、按分类名称自动选图标。设置中的“面板条目图标样式”可选统一默认线条图标、Windows 原图标，或经过低饱和冷色调处理的原图标。异常数值会归一化。`dock_position: {"x": 0.5, "y": 0.4}` 保存主屏工作区中的相对中心位置；旧配置无该字段时使用默认位置。边缘保留圆环与阴影，靠近底部时面板改在上方展开。当前仍限主屏工作区，不宣称跨屏拖动。
 
-配套的健壮性处理：
+收起圆环后点击中心会清理当前用户 `%TEMP%` 下超过 24 小时的文件，跳过正在使用的文件和重解析点，并显示释放的磁盘空间。内存整理调用 WinMemoryCleaner 的 `/StandbyListLowPriority` 命令。启动 ring-dock 时会请求一次 UAC，以启动仅处理内存整理的后台助手；助手随 ring-dock 运行，点击清理时不再重复弹窗，主界面保持普通权限。默认从 ring-dock 同目录、`%LOCALAPPDATA%\RingDock`、PATH、常见 WinGet/Scoop/Program Files 位置查找，也可在 `config.json` 设置 `win_memory_cleaner_path` 指向 `WinMemoryCleaner.exe`。当前用户级便携版存放在 `%LOCALAPPDATA%\RingDock\WinMemoryCleaner.exe`，来源为[官方 3.0.8 发布页](https://github.com/IgorMundstein/WinMemoryCleaner/releases/tag/3.0.8)，GPL-3.0。未找到工具时仍会完成临时文件清理并提示内存整理未执行。
 
-- Explorer 重启 / 切换壁纸会连带销毁桌面子窗口 → `WM_DESTROY` 里**重建窗口并重挂**（不退出）+ 定时器低频校验挂载点
-- 父链加 `WS_CLIPCHILDREN`，防止图标层重绘擦掉挂件
-- 桌面子窗口收不到 `WM_DISPLAYCHANGE` → 定时器对比工作区几何变化后重新摆放
-- 挂载失败退回顶层并把 Z 序压到 `HWND_BOTTOM`（仍满足不遮挡；此档位才可能被 Win+D 带走，定时器持续重试嵌入）
-- **自擦（防残影）**：桌面子窗口的暴露区没人自动擦（Explorer 平时静态不重绘），
-  `SetWindowRgn` 缩小（收起面板）后会留残影。配套机制（`deskpin::blit_snapshot` + `repaint_desktop_area`）：
-  **先把即将暴露的区域铺回干净桌面快照（必须在缩 Rgn 之前，Rgn 外绘制会被裁剪）**，
-  再异步请桌面树重绘换回真身。窗口整体挪动同理。
+诊断仅显式启用：
 
-实测（Windows 11）：挂载层级 `RingDockVisual ← SysListView32 ← SHELLDLL_DefView ← Progman`，
-Win+D 后普通窗口全部最小化而挂件保持可见未最小化。
+- `RING_DOCK_CONFIG`：隔离配置路径。
+- `RING_DOCK_FRAME`：输出当前原始预乘 BGRA 帧（前 8 bytes 是 little-endian i32 宽、高）与布局 JSON；正式运行不要启用，避免诊断磁盘写入。
+- `RING_DOCK_DROP_LOG`：明确的拖放日志文件路径；默认无日志。
+- `--preview`：不嵌入桌面，临时置顶用于隔离验证；**不是正式运行参数**。
 
-## 模块地图（业务与能力分离）
+## 构建 / 回归
 
-| 模块 | 职责 | 业务耦合 |
-|---|---|---|
-| `crates/deskpin` | 「固定显示在桌面上」全部能力：桌面树嵌入 / 挂载自愈（`Pinner`）/ 工作区摆放 / DPI | **无**（可整目录拷走复用） |
-| `src/hit.rs` | 点击命中测试（纯函数 + 单测），与绘制几何严格一一对应 | 几何即业务，但逻辑独立 |
-| `src/tray.rs` | 托盘图标（Explorer 重启自重建） | 菜单命令即业务 |
-| `src/settings_ui.rs` | 设置窗口（纯 Win32 控件） | 设置项即业务 |
-| `src/render.rs / blur.rs / icons.rs` | Direct2D 绘制 / 模糊 / 矢量图标 | 业务 |
-| `src/sys.rs` | 仅剩业务用小工具（屏幕快照 / 本地时间） | 业务 |
-
-接入 deskpin 只需三步（详见其文档）：`enable_dpi_awareness()` → `Pinner::attach(hwnd)` →
-定时器里 `Pinner::maintain(hwnd)`；并在 `WM_DESTROY`（非用户退出）时重建窗口再 `attach`。
-
-## 构建与运行
+需要 Windows、Rust MSVC 工具链以及 Windows SDK 资源编译器。
 
 ```powershell
+cargo fmt --all -- --check
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
 cargo build --release
 .\target\release\ring-dock.exe
 ```
 
-首次运行在 exe 同目录生成 `config.json`。仓库为 cargo workspace（根 = 业务，`crates/deskpin` = 可复用能力）。
+可信回归脚本（先正常退出正式实例，避免同位置两个桌面挂件干扰观察；脚本不写正式配置）：
 
-## 交互
-
-- **左键点击象限弧段**：展开该象限面板（**展开时圆环整体消失**，只剩玻璃面板）；再点同一弧段 = 收起；已展开时点击其他弧段 = 切换或先收起（设置可配）
-- **左键点击面板图标**：打开该项（程序/文件/文件夹/网址）；打开后是否自动收起面板可配
-- **点击空白处**（弧缝 / 面板空白 / 中心时钟）：收起面板（保证“回得去”）
-- **滚轮**：面板内容超多时内滚
-- **右键圆环 / 托盘图标**：菜单（设置… / 重新加载配置 / 打开配置文件 / 退出）
-- **托盘图标**：正常退出入口（左/右键均弹菜单），Explorer 重启后自动重建
-
-命中判定与绘制几何严格一致（`src/hit.rs`，带单元测试）：点弧缝不误触发、点 A 弧不会触发 B 象限。
-
-绘制要点（防闪烁/残影）：
-
-- 每帧第一笔 = 铺清晰桌面快照（**不用色键色 Clear**——品红中间帧就是“闪紫”根因；类背景刷也置空）
-- 快照 = **纯桌面**（抓屏前短暂隐藏自身，毫秒级；blur 后置计算不占隐藏时长）；
-  展开态把圆环区铺回纯快照 = 视觉上圆环消失；每 ~60s 周期刷新快照跟进桌面变化
-
-## config.json
-
-```jsonc
-{
-  "quadrant_count": 4,        // 象限数 2~8
-  "opacity": 0.85,            // 圆环整体透明度
-  "clock_format": "%H:%M",    // 中心时钟格式
-  "icon_size": 48,            // 面板图标尺寸
-  "item_gap": 12, "row_gap": 16, "panel_padding": 16,
-  "max_columns": 5,           // 每排最多列数（超长换排）
-  "max_height_ratio": 0.72,   // 面板最大高度（屏高比例，超出内滚）
-  "switch_panel_on_click": true,       // 展开时点其他象限：true=直接切换，false=先收起再点才展开
-  "auto_collapse_after_open": true,    // 打开条目后自动收起面板
-  "quadrants": [
-    {
-      "label": "程序", "kind": "program",
-      "items": [
-        { "name": "记事本", "kind": "program", "target": "notepad.exe" },
-        { "name": "Bing",  "kind": "url",     "target": "https://www.bing.com" }
-      ]
-    }
-  ]
-}
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\orbit\verify.ps1 -Exe E:\tools\ring-dock\target\release\ring-dock.exe
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\orbit\verify_drag.ps1 -Exe E:\tools\ring-dock\target\release\ring-dock.exe
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\orbit\verify_desktop.ps1
+python tools\orbit\verify_controlled_pixels.py
 ```
 
-`kind` 取 `program` / `file` / `folder` / `url`；`target` 为可执行名/路径/目录/网址。
+脚本按 PID 选择自己的窗口、使用隔离配置、结束退出测试进程。真实点击/拖放会短暂移动鼠标后恢复位置，不要在此期间操作鼠标。桌面验证用临时 DWM 观测窗，另用蓝/黄受控底色验证实际合成；截图仅用于测试，从不进入正式渲染管线。C# 辅助程序由系统 .NET Framework 编译器生成；像素检查用 Python + Pillow。
 
-## 回归测试
+## 项目布局
 
-- `cargo test`：命中测试单元测试（弧段/弧缝/中心/面板格，含跨区域误触发回归）
-- `tools/smoke_embed.ps1`：桌面挂载 + Win+D 免疫（debug 构建）
-- `tools/smoke_interact.ps1`：交互行为回归（模拟点击 + GetRegionData 精确观测命中区域：弧缝不误触发/展开收起/切换两档/面板空白收起/设置窗口/退出）
-- `tools/smoke_erase.ps1`：残影回归（截图像素对比：收起/切换后面板内容必须消失；判据不受动态壁纸与遮挡干扰，自动按需 Win+D）
+- `src/render.rs`：唯一正式绘制管线、共享面板几何。
+- `src/hit.rs`：与绘制共用布局的命中判定。
+- `src/main.rs`：状态、交互、窗口重建与资源生命周期。
+- `src/drop.rs`：OLE 文件收纳、格式/效果过滤、去重。
+- `src/config.rs`：配置、参数归一化、原子保存。
+- `crates/deskpin/`：桌面挂载，不掺业务渲染。
+- `tools/orbit/` / `reports/orbit-glass/`：当前回归与实际画面证据。
+- `tools/transparency/` / `reports/transparency/`：前一轮独立半透明验证。
+- `archive/legacy-region-20261003/`：停用实现与历史文档，不参与编译，不作为当前约束。
 
-## 已知边界（初版）
+## 验证边界
 
-- 只支持主屏（多屏/缩放下用工作区矩形，DPI 已设 Per-Monitor V2）
-- 面板展开瞬间的桌面快照为背景模糊源（展开后桌面变化不追帧）
-- 时钟格式仅支持上述三种
-- Explorer 重启/换壁纸会连带销毁嵌入子窗口（已自动重建重挂，建议手动验证一次）
-- Win11 若在「系统属性 → 性能选项」关闭了「动画控件和元素」，Explorer 不创建 WorkerW（仅影响图标之下档位）
-- 面板滚轮依赖系统「悬停时滚动非活动窗口」设置（Win10/11 默认开启）
-- 退出时窗口与托盘立即消失，但进程收尾（D2D/COM/GDI 清理）实测需 3~20s（随机器负载波动）才从进程表消失
-- 拖拽排序 / 开机自启未做（后续迭代）
+本次实际测试系统为 Windows NT 10.0.26200.0，真实宿主 `SysListView32`。当前验证不等于所有 Windows 版本、所有桌面壁纸工具或多屏 DPI 组合均已兼容。Explorer 重启与 Win+D 未在本轮主动触发；窗口自愈通过销毁本应用自身窗口验证。背景模糊、全局键盘导航和多屏布局不是本次已交付能力。
+
+详细结果见 `reports/orbit-glass/REPORT.md`；历史“桌面不能半透明”的绝对结论已作废。
+
+## 桌面快捷方式导入
+
+2026-10-03 已将用户桌面、公共桌面以及桌面文件夹中的 61 个快捷方式加入正式配置，保留原有 9 个收藏；58 个程序快捷方式加入「程序」，3 个 URL 快捷方式加入「网址」。不移动/删除/改写源文件，保留原 `.lnk` / `.url` 路径（ShellExecute 保留启动参数、工作目录、协议等语义）。扫描不执行快捷方式。
+
+复用导入工具时先正常退出正式实例，避免并发写配置。默认递归用户与公共桌面，不跟随目录重解析点。去重覆盖所有分类，不区分路径大小写；重复导入不重新写盘。无效配置直接失败，不用默认收藏覆盖。写入前生成原配置备份，使用同目录临时文件与原子替换。
+
+```powershell
+# 先预览，不修改配置
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\orbit\import_desktop.ps1 -ConfigPath E:\tools\ring-dock\target\release\config.json -ScanOnly
+# 正式导入（请先退出程序）
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\orbit\import_desktop.ps1 -ConfigPath E:\tools\ring-dock\target\release\config.json
+# 新功能的隔离回归
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\orbit\verify_middle_drag.ps1 -Exe E:\tools\ring-dock\target\release\ring-dock.exe
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\orbit\verify_middle_drag.ps1 -Exe E:\tools\ring-dock\target\release\ring-dock.exe -Desktop
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\orbit\verify_import.ps1
+```
+
+本轮证据与实际桌面图见 `reports/middle-drag/REPORT.md`。配置及 exe 改造前备份在 `target/backups/middle-drag-20261003/`，源码快照在 `target/before-middle-drag-20261003/`。回滚时不要用旧配置覆盖用户后来新增的收藏。

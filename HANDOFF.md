@@ -1,167 +1,67 @@
-# HANDOFF —— ring-dock 项目交接档案
+# 当前交接：Orbit Glass（2026-10-03）
 
-> 供新会话/协作者快速接手。包含：项目现状、架构、**经实战验证的可靠经验（踩坑档案）**、
-> 回归测试手册、已知边界。更新时间：2026-10（视觉极简化 + 真透明方案定案后）。
+## 最高优先事实
 
-## 一、项目是什么
+当前正式管线是 Direct2D/DirectWrite 绘制预乘 BGRA，随后 UpdateLayeredWindow(ULW_ALPHA)。真实桌面逐像素透明已验证，不允许再凭旧探针的不可见截图推断“桌面不能透明”。旧区域裁剪、GDI 字形区域、抓壁纸伪透明均已退出编译。
 
-**ring-dock**：Windows 桌面圆环收纳挂件（Rust + 纯 Win32/Direct2D，零第三方 UI 框架）。
-半透明圆环固定在屏幕中心，按象限收纳程序/文件/文件夹/网址；点击象限展开玻璃面板点图标打开。
+- 桌面半透明基础证据：`reports/transparency/REPORT.md`。
+- 当前正式版证据：`reports/orbit-glass/REPORT.md`、JSON 结果和 DWM 实际合成截图。
+- 旧 HANDOFF、代码与有污染风险的脚本：`archive/legacy-region-20261003/`。只供回溯，不能照搬其约束或直接执行旧脚本。
 
-**两个核心刚需（已解决）**：
-1. **固定显示在桌面上**：不遮挡任何应用窗口、不受 Win+D /「最小化所有」影响；
-2. **好点、不卡、不闪**：点击响应 30~50ms，无闪烁无残影。
+## 关键不变量
 
-## 二、架构与模块地图
+1. DIB 为 top-down 32-bit **预乘** BGRA；RGB 不大于 alpha。整体 SourceConstantAlpha=255，不对整窗施加统一 alpha 淡化文字。
+2. DirectWrite 使用灰度 AA。时钟主体不透明，玻璃背景独立 alpha；透明不等于背景模糊。
+3. 不调用 SetWindowRgn / SetLayeredWindowAttributes，不抓桌面作渲染背景，不 GDI 画字。
+4. 粗弧片为平头。细线可以圆头，44px 宽弧的圆头会在小角度缺口处互相叠加变成黑点。
+5. 绘制与命中共用 PanelLayout：header 58、footer 32、内容裁剪、滚动上限、圆角判定一致。
+6. 完全透明区域可穿透，不能靠直接 SendMessage 证明系统真实命中。现有验证区分了真实点击、命中查询、消息注入和真实 OLE 拖放。
+7. 生产窗口不置顶。只在显式 --preview 下创建时设置 WS_EX_TOPMOST；临时 DWM 观测窗也可置顶，完成即销毁。
+8. OLE 在 UI 线程初始化一次，初始窗口和自愈新窗口都注册 DropTarget；销毁时 RevokeDragDrop，CF_HDROP 的 STGMEDIUM 必须 ReleaseStgMedium。
+9. App 唯一由 app_box 拥有；不要另构 Box::from_raw 释放同一指针。WM_DESTROY 不同步递归建窗，通过线程消息 WM_APP+42 重建。
+10. 排序在抬起/捕获取消时保存，不在每次 mousemove 写盘。原子配置替换失败保留原文件并反馈；禁止测试写正式配置。
 
-```
-ring-dock/
-├── crates/deskpin/        ★ 零业务可复用 crate：「固定显示在桌面上」全部能力
-│   └── src/lib.rs         Pinner（挂载/自愈）/ find_desktop_host（降级链）/
-│                          place_workarea / repaint_desktop_area / wide / DPI
-├── src/
-│   ├── main.rs            窗口创建、消息循环、App 状态、挂载自愈接线、托盘/设置接线
-│   ├── hit.rs             ★ 点击命中测试（纯函数 + 5 个单测），与绘制同源
-│   ├── render.rs          Direct2D 绘制（极简玻璃风：细弧/线性图标/时钟/面板）
-│   ├── icons.rs           矢量图标（program/file/folder/url，圆头线条）
-│   ├── config.rs          config.json 读写（serde，旧文件自动补默认字段）
-│   ├── tray.rs            托盘图标（Explorer 重启自重建）
-│   ├── settings_ui.rs     设置窗口（纯 Win32 控件）
-│   ├── open.rs            ShellExecute 打开条目
-│   └── sys.rs             本地时间/日期、deskpin::wide re-export
-├── tools/                 ★ 回归测试脚本（PowerShell，见§六）
-├── assets/ring.ico        exe 图标（build.rs/winres 嵌入）
-└── README.md              用户文档（含调研报告与方案对比）
-```
+## 交互 / 限制
 
-依赖：`windows 0.61`、`serde/serde_json`、`windows-numerics`、`winres`（build）。
-构建：`cargo build --release`；单测：`cargo test`。
+分类切换、关闭、整理、长按、排序、移除、滚动、自动展开拖入、去重、错误提示都已实现。收藏移除不删除原文件。只接受允许 COPY 的 CF_HDROP；拒绝仅 MOVE 和纯文本。当前不抢焦点，不宣称全局 Esc 可用；不承诺点透明外部能关面板。
 
-## 三、当前功能清单
+动画为展开160ms淡入，没有常驻16ms重绘。诊断帧/日志由明确环境变量开启，正式版本不设这些变量。
 
-- 圆环按象限收纳条目（2~8 象限可配），点击弧段展开玻璃面板，面板内线性图标+名称网格
-- **展开时仅隐藏被点击象限的弧段**（其余圆环/时钟照常），面板从圆环外缘展开
-- 命中行为：弧段=展开/收起/切换；弧缝、面板空白、中心=收起；面板开着点其他弧段=切换或先收起（可配）
-- 滚轮内滚、右键菜单（设置/重载配置/打开配置/退出）、托盘图标（同菜单，正常退出入口）
-- 设置窗口：`switch_panel_on_click`（切换 or 先收起）、`auto_collapse_after_open`（打开后自动收面板）
-- 中心时钟 + 日期行（`%H:%M` / `%H:%M:%S` / `%I:%M %p`）
-- 桌面固定显示 + 挂载自愈（Explorer 重启自动重建重挂）
-- config.json 全量可配（象限/条目/透明度/布局尺寸等）
+主屏工作区与2–8分类几何有单测；多屏真实 DPI、主动重启 Explorer、Win+D 全组合尚未验证，勿冒称通过。deskpin 目前会设置祖先 WS_CLIPCHILDREN；这属于已有挂载逻辑，并非本次全新兼容性保证。
 
-## 四、★ 实战验证过的可靠经验（踩坑档案）
+## 安全复测
 
-### A. 桌面固定显示（deskpin 的存在依据）
+先退出当前正式实例（菜单命令103），不要杀 Explorer。只运行 tools/orbit 与 tools/transparency 的当前入口。verify.ps1 的成功启动目标是隔离静默 helper；错误启动使用不存在目标，不打开用户真实程序。verify_drag 的文件也只在 target 下。实际桌面截图通过 DWM 缩略图观察真实树，蓝/黄底层独立变化验证非预先混色。
 
-1. **唯一同时满足"不遮挡应用 + 抗 Win+D"的方式 = SetParent 挂进桌面窗口树**。
-   `WS_EX_TOPMOST` 两个需求都不满足（盖住应用、Win+D 照样最小化）；
-   Rainmeter 走的是 `EVENT_SYSTEM_FOREGROUND` 钩子+定时器压 Z 序，官方承认偶发失效。
-2. **挂载点降级链**：`SysListView32`（图标之上）→ `SHELLDLL_DefView` → Progman 子级 WorkerW
-   （图标之下，Win11 24H2 起）→ 顶层 WorkerW（Win10 壁纸层，`0x052C` 触发创建）→ Progman。
-3. **桌面子窗口不参与顶层窗口的最小化/显示桌面**（Win+D 只动 Progman 之外的普通窗口）——结构性免疫。
-4. **WS_POPUP→WS_CHILD 转换后 SetParent**；SetParent 返回值与"此前无父"难区分，**必须 GetParent 回读验证**，失败还原样式。
-5. **父链必须加 WS_CLIPCHILDREN**，否则图标层重绘会把挂件擦掉。
-6. **Explorer 重启/换壁纸会连带销毁子窗口**（跨进程父子的宿命）→ `WM_DESTROY` 里重建窗口重挂
-   （区分 quitting 标志），+ 定时器（~10s）`Pinner::maintain` 自愈。
-7. **桌面子窗口收不到 WM_DISPLAYCHANGE** → 定时器对比工作区几何变化。
-8. Win11 若关闭系统属性→性能→"动画控件和元素"，Explorer **不创建 WorkerW**（仅影响图标之下档位）。
-9. `0x052C` 私有消息是触发 WorkerW 创建的惯用法（Win10）；Win11 24H2 层级收进 Progman。
+构建与复测命令见 README.md。环境硬链接增量缓存失败时 Cargo 会回退复制，这是本机文件系统警告，不是通过忽略源代码警告；Clippy 源码检查须通过。
 
-### B. 透明与鼠标命中（本轮最大的坑，代价最高）
+## 回滚
 
-10. **`WS_EX_LAYERED` 窗口的命中测试与像素透明度挂钩**（MSDN："based on the shape **and transparency**"）：
-    - 色键透明（`LWA_COLORKEY`）区 **完全点不中**（点击穿到下层）——视觉上"细线+全透明底"时
-      用户必须精准点中线条像素，体验极差（实测复现）；
-    - 统一透明度（`LWA_ALPHA`，210/255）**也大幅劣化**（实测几乎点不中）；
-    - layered 窗口里**唯一可靠命中的是 alpha=255 实心像素**。
-11. **"半透明 + 随便点"在单窗口无解**，只有三条路（全部趟过）：
-    - **不透明玻璃块**（普通窗口 + SetWindowRgn，透明感用绘制模拟）→ 当前方案，命中 100%；
-    - **抓屏混色假透明**（普通窗口预合成桌面快照）→ 好点，但要维护快照（卡顿/闪烁/时机坑）；
-    - **双层窗口**（透明视觉层 + alpha≈0 的命中垫层转发鼠标）→ 两者兼得但复杂，已废弃。
-12. **普通窗口的命中 = 纯 Rgn**，与绘制内容无关 → "好看不好点"和"好点"可以解耦：
-    视觉画什么无所谓，SetWindowRgn 的形状说了算。Rgn 内全域可点是交互手感的关键。
-13. `CreateWindowExW` 直接创建 `WS_CHILD`（父=layered 窗口）会失败且 GetLastError=0；
-    创建为顶层再 `SetParent` +样式转换可以（若将来需要子窗口挂 layered 父）。
+本轮前完整源码/文档快照：`target/before-orbit-20261003/`。
+旧运行版exe与配置：`target/backups/orbit-glass-20261003/`。
+不要覆盖用户收藏。恢复程序前先正常退出当前进程，复制备份 exe 后重新启动；配置如需恢复须由用户明确选择。
 
-### C. 绘制、闪烁与性能
+## 最终清扫
 
-14. **立即模式（DCRenderTarget）下 `Clear(色键色)` 的中间帧用户看得见**（"闪紫"根因）。
-    底色要么是最终观感的一部分，要么=透明（普通窗口做不到"Clear 成透明"）。
-    类背景刷同理：`WM_ERASEBKGND` 的擦除帧也会闪，背景刷要与最终底色一致或吞掉擦除。
-15. **点击路径上不能有重活**：全屏抓取 + CPU 模糊（百万像素上采样）曾把点击拖到 100~300ms
-    且 `SW_HIDE` 抓屏造成"圆环消失一下"。现在点击路径只有 SetWindowRgn + 重绘一帧 = 30~50ms
-    （首次 98ms 是 D2D/字体一次性初始化）。
-16. **blur（盒式模糊）滑窗实现的经典 bug**：初始窗口和必须是 `clamp(k-r)`（边缘重复语义），
-    写成 `min(k, w-1)` 会让滑窗"减去和里没有的值"→ u32 下溢（debug panic / release 结果算花）。
-17. `RedrawWindow` 带 `RDW_UPDATENOW` 是**跨进程同步重绘**，与 Explorer 互相等待有阻塞/死锁风险；
-    只做"请桌面重绘"用异步 flags，且放在低频路径（定时器），别放点击路径。
+已归档并移除未使用的 deskpin::repaint_desktop_area：其旧说明依赖已不存在的 blit_snapshot，还带有区域裁剪时代的桌面自擦假设。deskpin 头部改为实际挂载逻辑和验证边界，WM_DESTROY 示例改为向主消息循环投递重建，不再把 Win+D / Explorer 行为写成未经本轮验证的绝对保证。
 
-### D. 残影（SetWindowRgn 缩小的暴露区）
+## 2026-10-03 后续：中键位置拖动 + 桌面快捷方式导入
 
-18. **Rgn 缩小后暴露的像素没人自动擦**（Explorer 桌面平时静态）→ 收起面板会留残影。
-    经验：**普通窗口**需要"交还桌面重绘"（`repaint_desktop_area`，RedrawWindow 异步）；
-    实测收起后与基线像素差 0.278（≈完美还原）。**layered 窗口走 DWM 合成一般不残影**。
-19. 若必须精确还原：**先铺回干净快照再缩 Rgn**（Rgn 外绘制会被裁剪，顺序不能反）；
-    快照抓取时**自己的绘制还在屏上** → 快照含自己 → 铺回去等于没消失，必须 hide→抓→show。
+- `src/placement.rs` 是中键移动的纯几何。App 的 `dock_drag` 与左键排序分离；可见圆环/面板可开始移动，透明区域不开始。不改变顶层窗口工作区/桌面宿主，仍由 D2D/ULW 绘制移动后的中心。
+- 只在松开中键、取消捕获/模式、退出时保存已移动位置；每个 mousemove 不写配置。左键点击/长按、滚轮在中键手势期间不触发。显式重新加载配置会丢弃旧手势、优先磁盘配置，防止覆盖外部编辑。
+- `dock_position` 为兼容旧配置的可选 x/y 相对坐标；归一化后按工作区恢复并限边。面板在靠近底部时翻到上方。当前不宣称跨屏拖动。
+- 用户与公共桌面递归扫描共61个源快捷方式，58个程序加入程序、3个URL加入网址。原有9个收藏与顺序保留，源文件哈希不变；正式配置目前70项（63程序/1文件/2文件夹/4网址）。这是本轮交付时的状态，用户之后调整合法。
+- `tools/orbit/import_desktop.ps1` 按全局路径大小写不敏感去重，保留原shortcut路径，不执行、不搬移、不展开到所有磁盘；不跟随目录重解析点。支持 ScanOnly；原子替换前备份并检查并发配置修改。
+- 新验证入口 `verify_middle_drag.ps1`（可加 -Desktop）与 `verify_import.ps1`。发布版验证、导入清单和图在 `reports/middle-drag/`。桌面验证新增 ReportDir 参数，像素验证支持报告目录参数，避免覆盖上一次的 Orbit Glass 证据。
+- 中键验证的多数场景是消息注入；preview 模式包含一项带 WindowFromPoint guard 的真实系统中键拖动。不要把全部检查冒称完整鼠标 E2E，不通过点击真实用户快捷方式验证启动。
 
-### E. 测试方法论（tools/ 脚本的血泪）
+## 2026-10-03 后续：四分类按使用场景重组
+- 正式配置 `target/release/config.json` 的四象限由类型划分（程序 63 / 文件 1 / 文件夹 2 / 网址 4）改为场景划分：日常协作 28 / 开发创作 25 / AI 助手 5 / 娱乐影音 12，共 70 项零丢失；条目原顺序保留，name/kind/target 逐字节未改。
+- 四象限 `kind` 统一为 program（圆环图标同形，以标签与四色区分）；面板内各条目图标仍按自身 kind 绘制。另立图标需改 `src/icons.rs`，本次未动代码、无需重新构建。
+- `tools/orbit/import_desktop.ps1` 改为优先按桌面来源文件夹路由（工具效率/通讯社交→日常协作，开发编程/设计引擎→开发创作，AI 应用→AI 助手，游戏影音→娱乐影音），无映射时回退到 kind 匹配再回退首象限；`verify_import.ps1` 十项全过，隔离验证了新路由。
+- 回滚：`target/backups/category-20261003/config.json`；恢复后向窗口发 WM_COMMAND 101（见 `tools/orbit/control.ps1`）或右键圆环 → 重新加载配置。
 
-20. **验证鼠标命中必须用真实鼠标**（`SetCursorPos + mouse_event`，走系统 hit-test）；
-    `SendMessage` 直达窗口过程，绕过 hit-test，会给出假阳性。
-21. **像素对比判据要免疫干扰**（动态壁纸、别的桌面挂件、被窗口遮挡、历史残影）：
-    残影的特征判据 = "收起后 ≈ 展开时"（Diff(after, open) 小），不受背景变化影响。
-22. **Win+D 是开关式**：必须按需触发（Covered 检测）且失败路径要还原，否则把用户窗口搞得最小化/错乱。
-23. **Rgn 面积（GetRegionData）比 bbox 可靠**：小面板（1 图标）完全落在圆盘 bbox 内，bbox 看不出展开。
-24. `PrintWindow` 对跨进程桌面子窗口不可靠（回退抓屏幕合成）；`GetDC+BitBlt` 抓的是
-    "屏幕共享缓冲的该区域 + 自身绘制"的混合，**被遮挡时会抓到遮挡窗口的内容**。
-25. 测试污染管理：失败路径必须复原配置（`switch_panel_on_click` 等）、收起面板、还原窗口，
-    否则下一轮测试的前提被破坏（真实发生过）。
-
-### F. 工具链坑
-
-26. **cargo 的 mtime 指纹**：文件在同一秒内被修改可能不触发重编（"Finished 0.93s"假构建）；
-    症状是"改了代码行为没变"，`touch` 文件或等 1 秒重编。
-27. **PowerShell**：`[Cls]::Method` 不带括号只是打印方法定义（静默不执行！）；静态方法传参要括号；
-    `ConvertFrom-Json` 对象不能直接赋新属性（用 `Add-Member`）；Add-Type 指定
-    `-ReferencedAssemblies` 会覆盖默认引用集（System.Text 等丢失）。
-28. 退出时窗口/托盘立即消失，但**进程收尾（D2D/COM/GDI 清理）3~20s**（随负载波动）——
-    Windows D2D 程序常见现象，非 bug；测试判定要放宽（脚本已按 30s 轮询）。
-
-## 五、关键实现索引（改代码先看这些）
-
-| 要改什么 | 去哪里 |
-|---|---|
-| 桌面挂载/自愈/工作区 | `crates/deskpin/src/lib.rs`（`Pinner`、`find_desktop_host`） |
-| 点击行为/命中判定 | `src/hit.rs`（纯函数+单测）、`src/main.rs::on_click` |
-| 命中区形状 | `src/main.rs::update_hit_rgn`（与视觉形状同步） |
-| 视觉（弧/图标/时钟/面板） | `src/render.rs`；图标 `src/icons.rs` |
-| 面板布局（绘制与命中共用） | `src/render.rs::PanelLayout::item_cell`（**唯一来源，勿另写公式**） |
-| 托盘/设置/配置 | `src/tray.rs`、`src/settings_ui.rs`、`src/config.rs` |
-| 颜色/透明观感 | `src/render.rs` 顶部 `INK/ACCENT` 常量 |
-
-## 六、回归测试手册（tools/）
-
-| 脚本 | 验证 | 备注 |
-|---|---|---|
-| `cargo test` | 命中几何单测（弧/缝/中心/面板格、跨区误触发回归） | 快，先跑 |
-| `smoke_interact.ps1` | 13 项交互（点击/切换两档/面板空白收起/设置/退出） | Rgn 观测，不干扰桌面 |
-| `smoke_embed.ps1` | 桌面挂载层级 + Win+D 免疫 | debug 构建；会按 Win+D |
-| `smoke_erase.ps1` | 残影（截图像素对比） | 自动按需 Win+D 显示桌面再还原 |
-| `hit_check.ps1` | **真实鼠标**命中验证（点弧段内空白） | 验命中必跑 |
-| `vis_check.ps1` | 视觉验收（窗口 DC 截图，不怕遮挡） | 改绘制后跑 |
-
-注意事项见 §四-E/F；测试会短暂 Win+D 显示桌面（结束自动还原），用户全屏游戏时慎跑屏幕类脚本。
-
-## 七、已知边界 / 未做
-
-- 只支持主屏（工作区矩形；DPI 已 Per-Monitor V2）
-- 时钟格式仅三种；面板滚轮依赖系统"悬停滚动"设置
-- 拖拽排序、开机自启未做
-- 玻璃为不透明深色块（真透明会牺牲命中，见 §四-B）——可调颜色/加渐变模拟透光
-- 视觉细节（弧粗细、色值、字号）都是常量级可调，等用户审美反馈迭代
-
-## 八、新会话快速上手
-
-1. 读本文件 + `README.md`（调研报告与方案对比在 README）；
-2. `cargo build --release` → `cargo test` → 跑 `tools/` 脚本确认环境；
-3. 改动命中/布局相关必须同步 `hit.rs` 单测；改视觉用 `target/vis_check.ps1`（窗口 DC 截图）验收；
-4. **动透明/窗口样式前先读 §四-B**（layered 命中陷阱，别再踩）；改视觉用 `tools/vis_check.ps1` 截图验收。
+## 2026-10-08 后续：分类图标与弧形文字设置
+- `category_display_mode` 控制圆环分类显示为图标、弧形文字或两者；旧配置缺省为两者。
+- 各 `quadrants[].category_icon` 可设为自动、协作、开发、AI、娱乐、程序、文件、文件夹或网址图标；自动模式继续依据分类名映射语义图标。
+- 纯文字模式逐字沿分类弧段旋转排布，底部象限反向排字以保持正向阅读。设置窗口可编辑显示方式和每个分类图标；只在用户保存时写入配置。

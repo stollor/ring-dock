@@ -1,0 +1,41 @@
+{
+  "quadrant_count": 4,
+  "opacity": 0.85,
+  "clock_format": "%H:%M",
+  "icon_size": 48,
+  "item_gap": 12,
+  "row_gap": 16,
+  "panel_padding": 16,
+  "max_columns": 5,
+  "max_height_ratio": 0.72,
+  "switch_panel_on_click": true,
+  "auto_collapse_after_open": true,
+  "quadrants": [
+    {
+      "label": "程序",
+      "kind": "program",
+      "items": [
+        {
+          "name": "记事本",
+          "kind": "program",
+          "target": "notepad.exe"
+        }
+      ]
+    },
+    {
+      "label": "文件",
+      "kind": "file",
+      "items": []
+    },
+    {
+      "label": "文件夹",
+      "kind": "folder",
+      "items": []
+    },
+    {
+      "label": "网址",
+      "kind": "url",
+      "items": []
+    }
+  ]
+}
