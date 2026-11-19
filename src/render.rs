@@ -8,12 +8,17 @@ use crate::{
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use windows::core::{Interface, PCWSTR};
-use windows::Win32::Foundation::{COLORREF, HWND, POINT, RECT, SIZE};
+use windows::Win32::Foundation::{COLORREF, GENERIC_READ, HWND, POINT, RECT, SIZE};
 use windows::Win32::Graphics::Direct2D::Common::*;
 use windows::Win32::Graphics::Direct2D::*;
 use windows::Win32::Graphics::DirectWrite::*;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::*;
+use windows::Win32::Graphics::Imaging::{
+    CLSID_WICImagingFactory, GUID_WICPixelFormat32bppPBGRA, IWICImagingFactory,
+    WICBitmapDitherTypeNone, WICBitmapInterpolationModeFant, WICBitmapPaletteTypeCustom,
+    WICDecodeMetadataCacheOnLoad,
+};
 use windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES;
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoUninitialize, IPersistFile, CLSCTX_INPROC_SERVER,
@@ -289,6 +294,7 @@ pub struct Renderer {
     name: Option<IDWriteTextFormat>,
     heading: Option<IDWriteTextFormat>,
     shell_icons: HashMap<(String, IconStyle, usize), Option<ID2D1Bitmap>>,
+    category_bitmaps: HashMap<String, Option<ID2D1Bitmap>>,
     pending_shell_icons: HashSet<(String, IconStyle, usize)>,
     shell_icon_tx: SyncSender<IconResult>,
     shell_icon_rx: Receiver<IconResult>,
@@ -304,6 +310,71 @@ fn rc(x: f32, y: f32, w: f32, h: f32) -> D2D_RECT_F {
         bottom: y + h,
     }
 }
+fn draw_category_bitmap(
+    rt: &ID2D1DCRenderTarget,
+    bitmap: &ID2D1Bitmap,
+    x: f32,
+    y: f32,
+    size: f32,
+    alpha: f32,
+) {
+    let rect = rc(x - size * 0.5, y - size * 0.5, size, size);
+    unsafe {
+        rt.DrawBitmap(
+            bitmap,
+            Some(&rect),
+            alpha,
+            D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+            None,
+        );
+    }
+}
+
+fn load_image_pixels(path: &str) -> Option<Vec<u8>> {
+    let ext = std::path::Path::new(path).extension()?.to_str()?;
+    if !matches!(
+        ext.to_ascii_lowercase().as_str(),
+        "png" | "jpg" | "jpeg" | "bmp" | "gif" | "tif" | "tiff" | "webp" | "ico"
+    ) {
+        return None;
+    }
+    const SIZE: u32 = 36;
+    unsafe {
+        let factory: IWICImagingFactory =
+            CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER).ok()?;
+        let name = crate::sys::wide(path);
+        let decoder = factory
+            .CreateDecoderFromFilename(
+                PCWSTR(name.as_ptr()),
+                None,
+                GENERIC_READ,
+                WICDecodeMetadataCacheOnLoad,
+            )
+            .ok()?;
+        let frame = decoder.GetFrame(0).ok()?;
+        let converter = factory.CreateFormatConverter().ok()?;
+        converter
+            .Initialize(
+                &frame,
+                &GUID_WICPixelFormat32bppPBGRA,
+                WICBitmapDitherTypeNone,
+                None,
+                0.0,
+                WICBitmapPaletteTypeCustom,
+            )
+            .ok()?;
+        let scaler = factory.CreateBitmapScaler().ok()?;
+        scaler
+            .Initialize(&converter, SIZE, SIZE, WICBitmapInterpolationModeFant)
+            .ok()?;
+        let mut pixels = vec![0u8; (SIZE * SIZE * 4) as usize];
+        scaler
+            .CopyPixels(std::ptr::null(), SIZE * 4, &mut pixels)
+            .ok()?;
+        Some(pixels)
+    }
+}
+
 fn c(rgb: (f32, f32, f32), a: f32) -> D2D1_COLOR_F {
     D2D1_COLOR_F {
         r: rgb.0,
@@ -345,6 +416,7 @@ impl Renderer {
             name: None,
             heading: None,
             shell_icons: HashMap::new(),
+            category_bitmaps: HashMap::new(),
             pending_shell_icons: HashSet::new(),
             shell_icon_tx,
             shell_icon_rx,
@@ -386,6 +458,7 @@ impl Renderer {
         }
         if self.rt.is_none() {
             self.shell_icons.clear();
+            self.category_bitmaps.clear();
             let props = D2D1_RENDER_TARGET_PROPERTIES {
                 r#type: D2D1_RENDER_TARGET_TYPE_SOFTWARE,
                 pixelFormat: D2D1_PIXEL_FORMAT {
@@ -754,6 +827,7 @@ impl Renderer {
         self.shell_icons.retain(|key, _| active.contains(key));
         let rt = self.rt.as_ref().unwrap().clone();
         self.collect_shell_icons(&rt, &active);
+        self.prepare_category_icons(st, &rt);
         {
             let back = self.back.as_ref().unwrap();
             unsafe {
@@ -1097,6 +1171,27 @@ impl Renderer {
         }
     }
 
+    fn prepare_category_icons(&mut self, st: &SceneState, rt: &ID2D1DCRenderTarget) {
+        let wanted: Vec<String> = st
+            .cfg
+            .quadrants
+            .iter()
+            .filter_map(|quadrant| crate::icons::custom_icon_path(&quadrant.category_icon))
+            .map(str::to_string)
+            .collect();
+        self.category_bitmaps
+            .retain(|path, _| wanted.iter().any(|wanted| wanted == path));
+        for path in wanted {
+            if self.category_bitmaps.contains_key(&path) {
+                continue;
+            }
+            let pixels = load_image_pixels(&path)
+                .or_else(|| Self::load_shell_pixels(&path, IconStyle::Original, 0));
+            let bitmap = pixels.and_then(|pixels| Self::create_shell_bitmap(rt, &pixels));
+            self.category_bitmaps.insert(path, bitmap);
+        }
+    }
+
     fn ring(&self, rt: &ID2D1DCRenderTarget, st: &SceneState) {
         let g = st.geom;
         let opacity = st.cfg.opacity.clamp(0.3, 1.0);
@@ -1175,22 +1270,32 @@ impl Renderer {
                 let y = g.cy + g.r_mid * a.sin();
                 let icon_kind = match quad.category_icon.as_str() {
                     "" | "auto" => crate::icons::category_icon(&quad.label).unwrap_or(&quad.kind),
-                    "collaboration" | "development" | "ai" | "entertainment" | "program"
-                    | "file" | "folder" | "url" => quad.category_icon.as_str(),
+                    kind if crate::icons::is_builtin_icon(kind) => kind,
                     _ => crate::icons::category_icon(&quad.label).unwrap_or(&quad.kind),
                 };
+                let custom = crate::icons::custom_icon_path(&quad.category_icon).and_then(|path| {
+                    self.category_bitmaps
+                        .get(path)
+                        .and_then(|bitmap| bitmap.as_ref())
+                });
                 let color = if hot || active { col } else { WHITE };
                 match st.cfg.category_display_mode {
-                    CategoryDisplayMode::Icon => draw_icon(
-                        rt,
-                        self.b(color, 0.96),
-                        icon_kind,
-                        x,
-                        y,
-                        18.0,
-                        1.6,
-                        self.stroke.as_ref(),
-                    ),
+                    CategoryDisplayMode::Icon => {
+                        if let Some(bitmap) = custom {
+                            draw_category_bitmap(rt, bitmap, x, y, 22.0, 0.96);
+                        } else {
+                            draw_icon(
+                                rt,
+                                self.b(color, 0.96),
+                                icon_kind,
+                                x,
+                                y,
+                                18.0,
+                                1.6,
+                                self.stroke.as_ref(),
+                            );
+                        }
+                    }
                     CategoryDisplayMode::Text => self.curved_category_text(
                         rt,
                         &quad.label,
@@ -1199,16 +1304,20 @@ impl Renderer {
                         if hot || active { col } else { MUTED },
                     ),
                     CategoryDisplayMode::Both => {
-                        draw_icon(
-                            rt,
-                            self.b(color, 0.94),
-                            icon_kind,
-                            x,
-                            y - 6.0,
-                            16.0,
-                            1.5,
-                            self.stroke.as_ref(),
-                        );
+                        if let Some(bitmap) = custom {
+                            draw_category_bitmap(rt, bitmap, x, y - 6.0, 18.0, 0.94);
+                        } else {
+                            draw_icon(
+                                rt,
+                                self.b(color, 0.94),
+                                icon_kind,
+                                x,
+                                y - 6.0,
+                                16.0,
+                                1.5,
+                                self.stroke.as_ref(),
+                            );
+                        }
                         self.text(
                             rt,
                             &quad.label,
@@ -1790,7 +1899,7 @@ impl Renderer {
         } else if st.drop_hot {
             "松开鼠标 · 收纳到此分类".into()
         } else if st.edit_mode {
-            "拖动排序 · 点 − 删除".into()
+            "点条目可移到其他分类 · 拖动排序 · 点 − 删除".into()
         } else {
             format!("{} 个收藏 · 中键拖动位置", q.items.len())
         };

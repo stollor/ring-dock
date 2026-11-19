@@ -1,4 +1,5 @@
-//! 拖拽收纳：把文件 / 快捷方式 / .url 拖到**展开的面板**上 → 自动加入该象限并写回 config.json
+//! 拖拽收纳：把文件 / 快捷方式 / .url 拖到**展开的面板**上 → 自动加入该象限并写回 config.json。
+//! 快捷方式保存它指向的真实目标，不保存桌面上的快捷方式文件。
 //!
 //! 接入点是 OLE `IDropTarget`（系统拖拽的标准协议）：Explorer 的文件拖拽提供 `CF_HDROP`。
 //! 只在「面板展开且落点在面板内」时接受拖放（否则 DROPEFFECT_NONE，拖拽指针显示禁止）。
@@ -191,17 +192,24 @@ pub fn add_items(cfg: &mut crate::config::Config, qi: usize, paths: &[String]) -
         if p.is_empty() {
             continue;
         }
+        let resolved = crate::shortcut::resolve(p);
+        let (target, args, workdir) = match resolved {
+            Some(link) => (link.target, link.args, link.workdir),
+            None => (p.clone(), String::new(), String::new()),
+        };
         let item = crate::config::Item {
             name: display_name(p),
-            kind: infer_kind(p).to_string(),
-            target: p.clone(),
+            kind: infer_kind(&target).to_string(),
+            target,
+            args,
+            workdir,
         };
         if let Some(q) = cfg.quadrants.get_mut(qi) {
-            if !q
-                .items
-                .iter()
-                .any(|existing| existing.target.eq_ignore_ascii_case(p))
-            {
+            if !q.items.iter().any(|existing| {
+                existing.target.eq_ignore_ascii_case(&item.target)
+                    && existing.args == item.args
+                    && existing.workdir.eq_ignore_ascii_case(&item.workdir)
+            }) {
                 q.items.push(item);
                 added += 1;
             }
@@ -212,20 +220,7 @@ pub fn add_items(cfg: &mut crate::config::Config, qi: usize, paths: &[String]) -
 
 /// 由路径推断条目类型（与 config 的 kind 取值一致）
 pub fn infer_kind(path: &str) -> &'static str {
-    let lower = path.to_lowercase();
-    if lower.ends_with(".url") {
-        "url"
-    } else if lower.ends_with(".lnk")
-        || lower.ends_with(".exe")
-        || lower.ends_with(".bat")
-        || lower.ends_with(".cmd")
-    {
-        "program"
-    } else if std::path::Path::new(path).is_dir() {
-        "folder"
-    } else {
-        "file"
-    }
+    crate::shortcut::classify(path)
 }
 
 /// 显示名 = 文件名去扩展名
@@ -262,6 +257,7 @@ mod tests {
     fn kind_and_name() {
         assert_eq!(infer_kind(r"C:\\a\\b.lnk"), "program");
         assert_eq!(infer_kind(r"C:\\a\\b.url"), "url");
+        assert_eq!(infer_kind("https://example.invalid"), "url");
         assert_eq!(infer_kind(r"C:\\a\\b.txt"), "file");
         assert_eq!(display_name(r"C:\\a\\b.txt"), "b");
         assert_eq!(display_name(r"C:\\a\\记事本.lnk"), "记事本");

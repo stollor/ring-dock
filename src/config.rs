@@ -3,12 +3,19 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-/// 单个收纳条目：kind 取 program / file / folder / url
-#[derive(Serialize, Deserialize, Clone)]
+/// 单个收纳条目：kind 取 program / file / folder / url。
+/// `target` 是真实目标。从快捷方式收纳时不保存桌面上的 `.lnk` / `.url` 路径。
+#[derive(Serialize, Deserialize, Clone, Default)]
 pub struct Item {
     pub name: String,
     pub kind: String,
     pub target: String,
+    /// 快捷方式上的启动参数。普通文件为空，不写入配置。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub args: String,
+    /// 快捷方式的工作目录。为空时由系统决定，不写入配置。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub workdir: String,
 }
 
 /// 一个象限：label = 类型名（显示用），kind = 类型图标，items = 收纳内容
@@ -109,6 +116,15 @@ fn is_auto_category_icon(icon: &String) -> bool {
     icon == "auto" || icon.is_empty()
 }
 
+fn blank_quadrant(index: usize) -> Quadrant {
+    Quadrant {
+        label: format!("分类 {}", index + 1),
+        kind: "program".into(),
+        category_icon: "auto".into(),
+        items: Vec::new(),
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -138,31 +154,37 @@ impl Default for Config {
                             name: "记事本".into(),
                             kind: "program".into(),
                             target: "notepad.exe".into(),
+                            ..Default::default()
                         },
                         Item {
                             name: "画图".into(),
                             kind: "program".into(),
                             target: "mspaint.exe".into(),
+                            ..Default::default()
                         },
                         Item {
                             name: "终端".into(),
                             kind: "program".into(),
                             target: "wt.exe".into(),
+                            ..Default::default()
                         },
                         Item {
                             name: "计算器".into(),
                             kind: "program".into(),
                             target: "calc.exe".into(),
+                            ..Default::default()
                         },
                         Item {
                             name: "资源管理器".into(),
                             kind: "program".into(),
                             target: "explorer.exe".into(),
+                            ..Default::default()
                         },
                         Item {
                             name: "截图".into(),
                             kind: "program".into(),
                             target: "ms-screenclip:".into(),
+                            ..Default::default()
                         },
                     ],
                 },
@@ -174,6 +196,7 @@ impl Default for Config {
                         name: "待办.txt".into(),
                         kind: "file".into(),
                         target: r"C:\Users\Public\Documents\todo.txt".into(),
+                        ..Default::default()
                     }],
                 },
                 Quadrant {
@@ -185,11 +208,13 @@ impl Default for Config {
                             name: "下载".into(),
                             kind: "folder".into(),
                             target: r"C:\Users\Public\Downloads".into(),
+                            ..Default::default()
                         },
                         Item {
                             name: "文档".into(),
                             kind: "folder".into(),
                             target: r"C:\Users\Public\Documents".into(),
+                            ..Default::default()
                         },
                     ],
                 },
@@ -201,6 +226,7 @@ impl Default for Config {
                         name: "Bing".into(),
                         kind: "url".into(),
                         target: "https://www.bing.com".into(),
+                        ..Default::default()
                     }],
                 },
             ],
@@ -337,13 +363,62 @@ impl Config {
         if self.quadrants.is_empty() {
             self.quadrants = Self::default().quadrants;
         }
-        // 象限数多于配置条目时循环复用
-        let base_count = self.quadrants.len();
         while self.quadrants.len() < self.quadrant_count {
-            let q = self.quadrants[self.quadrants.len() % base_count].clone();
-            self.quadrants.push(q);
+            self.quadrants.push(blank_quadrant(self.quadrants.len()));
         }
         self.quadrants.truncate(self.quadrant_count);
+    }
+
+    /// 按设置调整分类数量和名称。新增的分类是空的。
+    /// 末尾分类里还有收藏时会保留，避免把数量改小后丢掉条目。
+    /// 返回实际生效的分类数。
+    pub fn apply_categories(&mut self, count: usize, edits: &[(String, String)]) -> usize {
+        let requested = count.clamp(2, 8);
+        let mut kept = Vec::new();
+        if self.quadrants.len() > requested {
+            for quadrant in self.quadrants.drain(requested..) {
+                if !quadrant.items.is_empty() {
+                    kept.push(quadrant);
+                }
+            }
+        }
+        while self.quadrants.len() < requested {
+            self.quadrants.push(blank_quadrant(self.quadrants.len()));
+        }
+        for (index, quadrant) in self.quadrants.iter_mut().take(requested).enumerate() {
+            let Some((label, icon)) = edits.get(index) else {
+                continue;
+            };
+            let label = label.trim();
+            quadrant.label = if label.is_empty() {
+                format!("分类 {}", index + 1)
+            } else {
+                label.chars().take(24).collect()
+            };
+            let icon = icon.trim();
+            quadrant.category_icon = if icon.is_empty() {
+                "auto".into()
+            } else {
+                icon.to_string()
+            };
+        }
+        self.quadrants.extend(kept);
+        self.quadrants.truncate(8);
+        self.quadrant_count = self.quadrants.len().clamp(2, 8);
+        self.quadrant_count
+    }
+
+    /// 把一条收藏移到另一个分类的末尾。
+    pub fn move_item_across(&mut self, from_q: usize, index: usize, to_q: usize) -> bool {
+        if from_q == to_q || from_q >= self.quadrants.len() || to_q >= self.quadrants.len() {
+            return false;
+        }
+        if index >= self.quadrants[from_q].items.len() {
+            return false;
+        }
+        let item = self.quadrants[from_q].items.remove(index);
+        self.quadrants[to_q].items.push(item);
+        true
     }
 
     /// 取当前时间字符串（首版时钟格式）
@@ -416,7 +491,9 @@ mod tests {
         cfg.normalize();
         assert_eq!(cfg.quadrant_count, 8);
         assert_eq!(cfg.quadrants.len(), 8);
-        assert_eq!(cfg.quadrants[5].label, cfg.quadrants[1].label);
+        assert_eq!(cfg.quadrants[5].label, "分类 6");
+        assert!(cfg.quadrants[5].items.is_empty());
+        assert_eq!(cfg.quadrants[1].label, "文件");
         assert_eq!(cfg.opacity, 0.85);
         assert_eq!(cfg.item_gap, 0.0);
         assert!(cfg.row_gap.is_finite() && cfg.panel_padding >= 8.0);
@@ -464,5 +541,52 @@ mod tests {
         // 越界安全
         assert!(!cfg.move_item(0, 0, 99));
         assert!(!cfg.remove_item(0, 99));
+    }
+
+    #[test]
+    fn category_count_grows_empty_and_shrink_keeps_items() {
+        let mut cfg = Config::default();
+        let original = cfg.quadrants[0].items.len();
+        let edits: Vec<(String, String)> = (0..6)
+            .map(|i| (format!("分类 {}", i + 1), "auto".into()))
+            .collect();
+        assert_eq!(cfg.apply_categories(6, &edits), 6);
+        assert!(cfg.quadrants[4].items.is_empty());
+        assert!(cfg.quadrants[5].items.is_empty());
+        assert_eq!(cfg.quadrants[0].items.len(), original);
+        cfg.quadrants[5].items.push(Item {
+            name: "留下".into(),
+            kind: "file".into(),
+            target: "keep.txt".into(),
+            ..Default::default()
+        });
+        let renamed = [
+            ("协作".into(), "collaboration".into()),
+            ("开发".into(), "development".into()),
+            ("设计".into(), "auto".into()),
+            ("助手".into(), "ai".into()),
+        ];
+        assert_eq!(cfg.apply_categories(4, &renamed), 5);
+        assert_eq!(cfg.quadrants[0].label, "协作");
+        let custom = [("资料".into(), r"C:\icons\notes.ico".into())];
+        assert_eq!(cfg.apply_categories(5, &custom), 5);
+        assert_eq!(cfg.quadrants[0].label, "资料");
+        assert_eq!(cfg.quadrants[0].category_icon, r"C:\icons\notes.ico");
+        assert_eq!(cfg.quadrants[4].items[0].name, "留下");
+        assert_eq!(cfg.quadrants[0].items.len(), original);
+    }
+
+    #[test]
+    fn move_item_across_categories() {
+        let mut cfg = Config::default();
+        let name = cfg.quadrants[0].items[0].name.clone();
+        let from_len = cfg.quadrants[0].items.len();
+        let to_len = cfg.quadrants[1].items.len();
+        assert!(cfg.move_item_across(0, 0, 1));
+        assert_eq!(cfg.quadrants[0].items.len(), from_len - 1);
+        assert_eq!(cfg.quadrants[1].items.len(), to_len + 1);
+        assert_eq!(cfg.quadrants[1].items.last().unwrap().name, name);
+        assert!(!cfg.move_item_across(0, 0, 0));
+        assert!(!cfg.move_item_across(0, 99, 1));
     }
 }

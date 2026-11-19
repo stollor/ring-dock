@@ -4,12 +4,13 @@ use crate::config::{CategoryDisplayMode, Config, IconStyle, Quadrant};
 use crate::open;
 use crate::sys::wide;
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::Mutex;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{COLORREF, RECT};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::UI::Controls::{
-    CheckDlgButton, IsDlgButtonChecked, BST_CHECKED, BST_UNCHECKED,
+    CheckDlgButton, IsDlgButtonChecked, BST_CHECKED, BST_UNCHECKED, EM_SETLIMITTEXT,
 };
 use windows::Win32::UI::Controls::{SetWindowTheme, DRAWITEMSTRUCT, ODS_FOCUS, ODS_SELECTED};
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -40,12 +41,38 @@ const ID_AUTOCLOSE: i32 = 1002;
 const ID_AUTOSTART: i32 = 1005;
 const ID_ICON_STYLE: i32 = 1003;
 const ID_CATEGORY_MODE: i32 = 1004;
+const ID_CATEGORY_COUNT: i32 = 1006;
 const ID_CATEGORY_ICON_BASE: i32 = 1100;
+const ID_CATEGORY_NAME_BASE: i32 = 1200;
+const ID_CATEGORY_FILE_BASE: i32 = 1300;
+const CATEGORY_SLOTS: i32 = 8;
+const ICON_PRESETS: [(&str, &str); 9] = [
+    ("auto", "自动（按分类名称）"),
+    ("collaboration", "对话气泡"),
+    ("development", "代码符号"),
+    ("ai", "AI 星芒"),
+    ("entertainment", "播放按钮"),
+    ("program", "程序窗口"),
+    ("file", "文件"),
+    ("folder", "文件夹"),
+    ("url", "网址"),
+];
 const ID_SAVE: i32 = 2001;
 const ID_CANCEL: i32 = 2002;
 const ID_OPENCFG: i32 = 2003;
 const ID_REQUEST_ENVIRONMENT: i32 = 2004;
+const ID_WEATHER_NOTE: i32 = 2005;
 
+static CATEGORY_ICON_PATHS: Mutex<[String; 8]> = Mutex::new([
+    String::new(),
+    String::new(),
+    String::new(),
+    String::new(),
+    String::new(),
+    String::new(),
+    String::new(),
+    String::new(),
+]);
 static SETTINGS_HWND: AtomicIsize = AtomicIsize::new(0);
 static MAIN_HWND: AtomicIsize = AtomicIsize::new(0);
 static CLASS_REGISTERED: AtomicBool = AtomicBool::new(false);
@@ -76,8 +103,9 @@ pub fn open_settings(
 
         // 居中于主屏工作区
         let (x, y, aw, ah) = deskpin::work_area();
-        let row_count = quadrants.len().clamp(2, 8);
-        let (ww, hh) = (640, 644 + row_count as i32 * 34);
+        let row_count = quadrants.len().clamp(2, 8) as i32;
+        let (_, _, hh) = category_layout(row_count);
+        let ww = 640;
         let wx = x + ((aw - ww) / 2).max(0);
         let wy = y + ((ah - hh) / 2).max(0);
 
@@ -375,68 +403,122 @@ unsafe fn create_controls(
         Some(LPARAM(1)),
     );
 
-    make("STATIC", "分类图标", base, 36, 410, 140, 24, 0);
-    const CATEGORY_ICONS: [(&str, &str); 9] = [
-        ("auto", "自动（按分类名称）"),
-        ("collaboration", "对话气泡"),
-        ("development", "代码符号"),
-        ("ai", "AI 星芒"),
-        ("entertainment", "播放按钮"),
-        ("program", "程序窗口"),
-        ("file", "文件"),
-        ("folder", "文件夹"),
-        ("url", "网址"),
-    ];
-    for (index, quadrant) in quadrants.iter().take(8).enumerate() {
-        let y = 446 + index as i32 * 34;
-        make("STATIC", &quadrant.label, base, 36, y + 3, 144, 20, 0);
+    make("STATIC", "分类数量", base, 36, 410, 140, 24, 0);
+    let count_cls = wide("COMBOBOX");
+    let count_combo = CreateWindowExW(
+        WINDOW_EX_STYLE(0),
+        PCWSTR(count_cls.as_ptr()),
+        PCWSTR::null(),
+        WINDOW_STYLE(base | CBS_DROPDOWNLIST as u32),
+        190,
+        404,
+        160,
+        180,
+        Some(parent),
+        Some(HMENU(ID_CATEGORY_COUNT as isize as *mut _)),
+        Some(deskpin::module_handle()),
+        None,
+    )
+    .unwrap_or_default();
+    let _ = SetWindowTheme(count_combo, PCWSTR(theme.as_ptr()), PCWSTR::null());
+    for count in 2..=CATEGORY_SLOTS {
+        let text = wide(&format!("{count} 个"));
+        let _ = SendMessageW(
+            count_combo,
+            CB_ADDSTRING,
+            Some(WPARAM(0)),
+            Some(LPARAM(text.as_ptr() as isize)),
+        );
+    }
+    let _ = SendMessageW(
+        count_combo,
+        WM_SETFONT,
+        Some(WPARAM(font.0 as usize)),
+        Some(LPARAM(1)),
+    );
+    make("STATIC", "名称", base, 36, 446, 140, 20, 0);
+    make("STATIC", "图标", base, 190, 446, 140, 20, 0);
+    let shown = quadrants.len().clamp(2, CATEGORY_SLOTS as usize) as i32;
+    for index in 0..CATEGORY_SLOTS {
+        let y = 468 + index * 34;
+        let quadrant = quadrants.get(index as usize);
+        let visible = if index < shown { WS_VISIBLE.0 } else { 0 };
+        let name = quadrant
+            .map(|q| q.label.clone())
+            .unwrap_or_else(|| format!("分类 {}", index + 1));
+        let edit_cls = wide("EDIT");
+        let edit_text = wide(&name);
+        let name_edit = CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            PCWSTR(edit_cls.as_ptr()),
+            PCWSTR(edit_text.as_ptr()),
+            WINDOW_STYLE(WS_CHILD.0 | visible | WS_BORDER.0 | ES_AUTOHSCROLL as u32 | WS_TABSTOP.0),
+            36,
+            y,
+            146,
+            28,
+            Some(parent),
+            Some(HMENU((ID_CATEGORY_NAME_BASE + index) as isize as *mut _)),
+            Some(deskpin::module_handle()),
+            None,
+        )
+        .unwrap_or_default();
+        let _ = SendMessageW(
+            name_edit,
+            EM_SETLIMITTEXT,
+            Some(WPARAM(24)),
+            Some(LPARAM(0)),
+        );
+        let _ = SendMessageW(
+            name_edit,
+            WM_SETFONT,
+            Some(WPARAM(font.0 as usize)),
+            Some(LPARAM(1)),
+        );
         let icon_cls = wide("COMBOBOX");
         let icon_combo = CreateWindowExW(
             WINDOW_EX_STYLE(0),
             PCWSTR(icon_cls.as_ptr()),
             PCWSTR::null(),
-            WINDOW_STYLE(base | CBS_DROPDOWNLIST as u32),
+            WINDOW_STYLE(WS_CHILD.0 | visible | CBS_DROPDOWNLIST as u32),
             190,
             y,
-            398,
-            120,
+            292,
+            160,
             Some(parent),
-            Some(HMENU(
-                (ID_CATEGORY_ICON_BASE + index as i32) as isize as *mut _,
-            )),
+            Some(HMENU((ID_CATEGORY_ICON_BASE + index) as isize as *mut _)),
             Some(deskpin::module_handle()),
             None,
         )
         .unwrap_or_default();
         let _ = SetWindowTheme(icon_combo, PCWSTR(theme.as_ptr()), PCWSTR::null());
-        for (_, label) in CATEGORY_ICONS {
-            let text = wide(label);
-            let _ = SendMessageW(
-                icon_combo,
-                CB_ADDSTRING,
-                Some(WPARAM(0)),
-                Some(LPARAM(text.as_ptr() as isize)),
-            );
-        }
-        let selected = CATEGORY_ICONS
-            .iter()
-            .position(|(value, _)| *value == quadrant.category_icon)
-            .unwrap_or(0);
-        let _ = SendMessageW(
-            icon_combo,
-            CB_SETCURSEL,
-            Some(WPARAM(selected)),
-            Some(LPARAM(0)),
-        );
         let _ = SendMessageW(
             icon_combo,
             WM_SETFONT,
             Some(WPARAM(font.0 as usize)),
             Some(LPARAM(1)),
         );
+        let icon = quadrant.map(|q| q.category_icon.as_str()).unwrap_or("auto");
+        fill_icon_combo(icon_combo, index as usize, icon);
+        make(
+            "BUTTON",
+            "自定义",
+            WS_CHILD.0 | visible,
+            490,
+            y,
+            98,
+            28,
+            ID_CATEGORY_FILE_BASE + index,
+        );
     }
+    let _ = SendMessageW(
+        count_combo,
+        CB_SETCURSEL,
+        Some(WPARAM((shown - 2) as usize)),
+        Some(LPARAM(0)),
+    );
 
-    let weather_y = 468 + quadrants.len().clamp(2, 8) as i32 * 34;
+    let (weather_y, _, _) = category_layout(shown);
     make(
         "BUTTON",
         "定位并更新天气",
@@ -455,7 +537,7 @@ unsafe fn create_controls(
         weather_y + 40,
         552,
         24,
-        0,
+        ID_WEATHER_NOTE,
     );
     let button_y = window_height - 84;
     make(
@@ -512,6 +594,177 @@ unsafe fn create_controls(
     .ok();
 }
 
+fn icon_paths() -> std::sync::MutexGuard<'static, [String; 8]> {
+    CATEGORY_ICON_PATHS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn icon_file_caption(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| path.to_string())
+}
+
+unsafe fn fill_icon_combo(combo: HWND, index: usize, icon: &str) {
+    let _ = SendMessageW(combo, CB_RESETCONTENT, Some(WPARAM(0)), Some(LPARAM(0)));
+    for (_, label) in ICON_PRESETS {
+        let text = wide(label);
+        let _ = SendMessageW(
+            combo,
+            CB_ADDSTRING,
+            Some(WPARAM(0)),
+            Some(LPARAM(text.as_ptr() as isize)),
+        );
+    }
+    let custom = crate::icons::custom_icon_path(icon);
+    if let Some(path) = custom {
+        if index < 8 {
+            icon_paths()[index] = path.to_string();
+        }
+        let caption = wide(&icon_file_caption(path));
+        let _ = SendMessageW(
+            combo,
+            CB_ADDSTRING,
+            Some(WPARAM(0)),
+            Some(LPARAM(caption.as_ptr() as isize)),
+        );
+    }
+    let selected = custom
+        .map(|_| ICON_PRESETS.len())
+        .or_else(|| ICON_PRESETS.iter().position(|(value, _)| *value == icon))
+        .unwrap_or(0);
+    let _ = SendMessageW(combo, CB_SETCURSEL, Some(WPARAM(selected)), Some(LPARAM(0)));
+}
+
+unsafe fn choose_category_icon(hwnd: HWND, index: usize) {
+    let Some(path) = pick_icon_file(hwnd) else {
+        return;
+    };
+    if index < 8 {
+        icon_paths()[index] = path.clone();
+    }
+    fill_icon_combo(
+        GetDlgItem(Some(hwnd), ID_CATEGORY_ICON_BASE + index as i32).unwrap_or_default(),
+        index,
+        &path,
+    );
+}
+
+unsafe fn pick_icon_file(owner: HWND) -> Option<String> {
+    use windows::core::Interface;
+    use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_INPROC_SERVER};
+    use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
+    use windows::Win32::UI::Shell::{
+        FileOpenDialog, IFileDialog, IFileOpenDialog, FILEOPENDIALOGOPTIONS, FOS_FILEMUSTEXIST,
+        FOS_FORCEFILESYSTEM, SIGDN_FILESYSPATH,
+    };
+    let open: IFileOpenDialog =
+        CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER).ok()?;
+    let dialog: IFileDialog = open.cast().ok()?;
+    dialog
+        .SetOptions(FILEOPENDIALOGOPTIONS(
+            FOS_FILEMUSTEXIST.0 | FOS_FORCEFILESYSTEM.0,
+        ))
+        .ok()?;
+    let title = wide("选择分类图标");
+    dialog.SetTitle(PCWSTR(title.as_ptr())).ok()?;
+    let filter_name = wide("程序、图标或图片");
+    let filter_spec = wide("*.exe;*.ico;*.dll;*.png;*.jpg;*.jpeg;*.bmp;*.webp");
+    let filters = [COMDLG_FILTERSPEC {
+        pszName: PCWSTR(filter_name.as_ptr()),
+        pszSpec: PCWSTR(filter_spec.as_ptr()),
+    }];
+    dialog.SetFileTypes(&filters).ok()?;
+    dialog.Show(Some(owner)).ok()?;
+    let item = dialog.GetResult().ok()?;
+    let name = item.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
+    if name.0.is_null() {
+        return None;
+    }
+    let mut len = 0usize;
+    while *name.0.add(len) != 0 {
+        len += 1;
+    }
+    let path = String::from_utf16_lossy(std::slice::from_raw_parts(name.0, len));
+    CoTaskMemFree(Some(name.0 as *const _));
+    if path.is_empty() {
+        None
+    } else {
+        Some(path)
+    }
+}
+
+fn category_layout(count: i32) -> (i32, i32, i32) {
+    let count = count.clamp(2, CATEGORY_SLOTS);
+    let weather = 490 + count * 34;
+    let height = weather + 176;
+    (weather, height - 84, height)
+}
+
+unsafe fn category_count_from_ui(hwnd: HWND) -> i32 {
+    let selected = SendMessageW(
+        GetDlgItem(Some(hwnd), ID_CATEGORY_COUNT).unwrap_or_default(),
+        CB_GETCURSEL,
+        Some(WPARAM(0)),
+        Some(LPARAM(0)),
+    )
+    .0;
+    if selected < 0 {
+        return 4;
+    }
+    (selected as i32 + 2).clamp(2, CATEGORY_SLOTS)
+}
+
+unsafe fn window_text(hwnd: HWND) -> String {
+    let mut buf = [0u16; 64];
+    let count = GetWindowTextW(hwnd, &mut buf);
+    String::from_utf16_lossy(&buf[..count.max(0) as usize])
+}
+
+unsafe fn move_control(parent: HWND, id: i32, x: i32, y: i32, w: i32, h: i32) {
+    let child = GetDlgItem(Some(parent), id).unwrap_or_default();
+    if child.0.is_null() {
+        return;
+    }
+    let _ = SetWindowPos(child, None, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+unsafe fn sync_category_rows(hwnd: HWND) {
+    let count = category_count_from_ui(hwnd);
+    for index in 0..CATEGORY_SLOTS {
+        let show = if index < count { SW_SHOW } else { SW_HIDE };
+        for id in [
+            ID_CATEGORY_NAME_BASE + index,
+            ID_CATEGORY_ICON_BASE + index,
+            ID_CATEGORY_FILE_BASE + index,
+        ] {
+            let child = GetDlgItem(Some(hwnd), id).unwrap_or_default();
+            if !child.0.is_null() {
+                let _ = ShowWindow(child, show);
+            }
+        }
+    }
+    let (weather, buttons, height) = category_layout(count);
+    move_control(hwnd, ID_REQUEST_ENVIRONMENT, 36, weather, 190, 32);
+    move_control(hwnd, ID_WEATHER_NOTE, 36, weather + 40, 552, 24);
+    move_control(hwnd, ID_OPENCFG, 36, buttons, 210, 36);
+    move_control(hwnd, ID_CANCEL, 352, buttons, 96, 36);
+    move_control(hwnd, ID_SAVE, 462, buttons, 126, 36);
+    let _ = SetWindowPos(
+        hwnd,
+        None,
+        0,
+        0,
+        640,
+        height,
+        SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+    );
+    let _ = InvalidateRect(Some(hwnd), None, true);
+}
+
 /// 读勾选 → 落盘 config.json → 通知主窗口重载
 unsafe fn save(hwnd: HWND) {
     let switch_on_click = IsDlgButtonChecked(hwnd, ID_SWITCH) != 0;
@@ -521,6 +774,7 @@ unsafe fn save(hwnd: HWND) {
     if !note.is_empty() {
         eprintln!("[ring-dock] {note}");
     }
+    crate::shortcut::retarget_config(&mut cfg);
     cfg.switch_panel_on_click = switch_on_click;
     cfg.auto_collapse_after_open = auto_collapse_after_open;
     cfg.auto_start = auto_start;
@@ -548,29 +802,38 @@ unsafe fn save(hwnd: HWND) {
         2 => IconStyle::Tinted,
         _ => IconStyle::Unified,
     };
-    const CATEGORY_ICON_VALUES: [&str; 9] = [
-        "auto",
-        "collaboration",
-        "development",
-        "ai",
-        "entertainment",
-        "program",
-        "file",
-        "folder",
-        "url",
-    ];
-    for (index, quadrant) in cfg.quadrants.iter_mut().take(8).enumerate() {
+    let requested = category_count_from_ui(hwnd) as usize;
+    let mut edits = Vec::with_capacity(requested);
+    let paths = icon_paths();
+    for index in 0..requested {
+        let name = window_text(
+            GetDlgItem(Some(hwnd), ID_CATEGORY_NAME_BASE + index as i32).unwrap_or_default(),
+        );
         let selected = SendMessageW(
             GetDlgItem(Some(hwnd), ID_CATEGORY_ICON_BASE + index as i32).unwrap_or_default(),
             CB_GETCURSEL,
             Some(WPARAM(0)),
             Some(LPARAM(0)),
         )
-        .0 as usize;
-        quadrant.category_icon = CATEGORY_ICON_VALUES
-            .get(selected)
-            .unwrap_or(&"auto")
-            .to_string();
+        .0;
+        let icon = if selected >= 0 && (selected as usize) < ICON_PRESETS.len() {
+            ICON_PRESETS[selected as usize].0.to_string()
+        } else {
+            paths.get(index).cloned().unwrap_or_default()
+        };
+        edits.push((name, icon));
+    }
+    drop(paths);
+    let applied = cfg.apply_categories(requested, &edits);
+    if applied > requested {
+        let text = wide("末尾分类里还有收藏，这些分类已保留。先把条目移到其他分类，再减少数量。");
+        let title = wide("分类数量");
+        let _ = MessageBoxW(
+            Some(hwnd),
+            PCWSTR(text.as_ptr()),
+            PCWSTR(title.as_ptr()),
+            MB_OK | MB_ICONINFORMATION,
+        );
     }
     match cfg.save() {
         Ok(()) => {
@@ -681,7 +944,15 @@ unsafe extern "system" fn settings_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPAR
         }
 
         WM_COMMAND => {
-            match (w.0 & 0xFFFF) as i32 {
+            let id = (w.0 & 0xFFFF) as i32;
+            let code = (w.0 >> 16) as u16;
+            if id == ID_CATEGORY_COUNT && code == CBN_SELCHANGE as u16 {
+                sync_category_rows(hwnd);
+            }
+            if (ID_CATEGORY_FILE_BASE..ID_CATEGORY_FILE_BASE + CATEGORY_SLOTS).contains(&id) {
+                choose_category_icon(hwnd, (id - ID_CATEGORY_FILE_BASE) as usize);
+            }
+            match id {
                 ID_SAVE => {
                     save(hwnd);
                     let _ = DestroyWindow(hwnd);

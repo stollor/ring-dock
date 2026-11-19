@@ -12,6 +12,7 @@ mod open;
 mod placement;
 mod render;
 mod settings_ui;
+mod shortcut;
 mod sys;
 mod tray;
 
@@ -32,12 +33,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetCursorPos, GetMessageW, GetWindowLongPtrW, KillTimer, LoadCursorW,
     PostMessageW, PostQuitMessage, RegisterClassW, SetTimer, SetWindowLongPtrW, ShowWindow,
     TrackPopupMenu, TranslateMessage, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, HMENU, IDC_ARROW,
-    IDC_HAND, IDC_SIZEALL, MF_STRING, MSG, SW_SHOWNOACTIVATE, TPM_NONOTIFY, TPM_RETURNCMD,
-    TPM_RIGHTBUTTON, WM_APP, WM_CANCELMODE, WM_CAPTURECHANGED, WM_COMMAND, WM_DESTROY,
-    WM_DISPLAYCHANGE, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_PAINT, WM_RBUTTONUP,
-    WM_SETCURSOR, WM_TIMER, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_POPUP,
+    IDC_HAND, IDC_SIZEALL, MF_GRAYED, MF_SEPARATOR, MF_STRING, MSG, SW_SHOWNOACTIVATE,
+    TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_CANCELMODE, WM_CAPTURECHANGED,
+    WM_COMMAND, WM_DESTROY, WM_DISPLAYCHANGE, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_NCCREATE, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WM_TIMER, WNDCLASSW, WS_EX_LAYERED,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 const WM_MOUSELEAVE: u32 = 0x02A3;
@@ -94,6 +95,8 @@ struct App {
     press_consumed: bool,
     /// 编辑态拖动中的条目序号
     drag_item: Option<usize>,
+    /// 本次拖动开始时的序号；没变过就是点击，用来打开“移到分类”。
+    drag_origin: Option<usize>,
     /// 中键移动整个挂件，与左键排序独立；只在结束时持久化。
     dock_drag: Option<placement::DockDrag>,
     hover: hit::Hit,
@@ -164,6 +167,7 @@ impl App {
     fn cancel_press(&mut self) {
         self.press_pt = None;
         self.drag_item = None;
+        self.drag_origin = None;
         self.press_consumed = false;
         unsafe {
             let _ = KillTimer(Some(self.hwnd), TIMER_HOLD);
@@ -485,6 +489,7 @@ impl App {
                 y,
             ) {
                 self.drag_item = Some(index);
+                self.drag_origin = Some(index);
             }
         }
     }
@@ -554,13 +559,15 @@ impl App {
             return;
         }
         let pressed = self.press_pt.take();
-        let consumed = self.press_consumed || self.drag_item.is_some();
-        let drag = self.drag_item.take().is_some();
+        let ended = self.drag_item.take();
+        let origin = self.drag_origin.take();
+        let reordered = matches!((ended, origin), (Some(now), Some(start)) if now != start);
+        let consumed = self.press_consumed || reordered;
         unsafe {
             let _ = KillTimer(Some(self.hwnd), TIMER_HOLD);
             let _ = ReleaseCapture();
         }
-        if drag {
+        if reordered {
             self.save_items();
         }
         let mut clicked = false;
@@ -570,13 +577,25 @@ impl App {
                 && self.hit_at(px, py) == self.hit_at(x, y)
             {
                 clicked = true;
-                self.on_click(x, y);
+                let item_click = self.edit_mode
+                    && matches!(
+                        (ended, self.expanded),
+                        (Some(index), Some(qi))
+                            if self.hit_at(x, y) == hit::Hit::Item { qi, index }
+                    );
+                if item_click {
+                    if let (Some(index), Some(qi)) = (ended, self.expanded) {
+                        self.popup_move_menu(qi, index);
+                    }
+                } else {
+                    self.on_click(x, y);
+                }
             }
         }
         self.press_consumed = false;
         // State-changing click handlers already redraw. Avoid rendering the same
         // full-screen layered frame a second time for one mouse-up event.
-        if drag || !clicked {
+        if reordered || !clicked {
             self.redraw();
         }
     }
@@ -606,7 +625,19 @@ impl App {
                     if self.edit_mode {
                         return;
                     }
-                    if let Err(e) = open::launch(&item.kind, &item.target) {
+                    let mut item = item;
+                    if shortcut::materialize_item(&mut item) {
+                        if let Some(stored) = self
+                            .cfg
+                            .quadrants
+                            .get_mut(qi)
+                            .and_then(|q| q.items.get_mut(index))
+                        {
+                            *stored = item.clone();
+                        }
+                        self.save_items();
+                    }
+                    if let Err(e) = open::launch(&item.target, &item.args, &item.workdir) {
                         self.status = Some((e, Instant::now()));
                         self.redraw();
                         return;
@@ -748,15 +779,92 @@ impl App {
         }
     }
 
+    fn popup_move_menu(&mut self, from: usize, index: usize) {
+        if self
+            .cfg
+            .quadrants
+            .get(from)
+            .and_then(|quadrant| quadrant.items.get(index))
+            .is_none()
+        {
+            return;
+        }
+        unsafe {
+            let Ok(menu) = CreatePopupMenu() else {
+                return;
+            };
+            let title = crate::sys::wide("移到其他分类");
+            let _ = AppendMenuW(menu, MF_GRAYED, 1, PCWSTR(title.as_ptr()));
+            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+            let mut labels = Vec::new();
+            for (i, quadrant) in self.cfg.quadrants.iter().enumerate() {
+                if i == from {
+                    continue;
+                }
+                let text = crate::sys::wide(&quadrant.label);
+                let _ = AppendMenuW(menu, MF_STRING, 4000 + i, PCWSTR(text.as_ptr()));
+                labels.push(text);
+            }
+            let mut p = POINT::default();
+            let _ = GetCursorPos(&mut p);
+            let owner = CreateWindowExW(
+                windows::Win32::UI::WindowsAndMessaging::WS_EX_TOOLWINDOW,
+                PCWSTR(crate::sys::wide("STATIC").as_ptr()),
+                PCWSTR::null(),
+                windows::Win32::UI::WindowsAndMessaging::WS_POPUP,
+                p.x,
+                p.y,
+                1,
+                1,
+                None,
+                None,
+                Some(deskpin::module_handle()),
+                None,
+            )
+            .unwrap_or(self.hwnd);
+            if owner != self.hwnd {
+                let _ = windows::Win32::UI::WindowsAndMessaging::ShowWindow(
+                    owner,
+                    windows::Win32::UI::WindowsAndMessaging::SW_SHOW,
+                );
+                let _ = windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(owner);
+            }
+            let command = TrackPopupMenu(
+                menu,
+                TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
+                p.x,
+                p.y,
+                None::<i32>,
+                owner,
+                None::<*const RECT>,
+            );
+            let _ = DestroyMenu(menu);
+            if owner != self.hwnd {
+                let _ = DestroyWindow(owner);
+            }
+            drop(labels);
+            let dest = command.0 as usize;
+            if (4000..4008).contains(&dest) && self.cfg.move_item_across(from, index, dest - 4000) {
+                self.save_items();
+                self.refresh_panel();
+            }
+        }
+    }
+
     fn reload_config(&mut self) {
         // 显式加载磁盘配置时不把旧内存位置写回覆盖外部编辑。
         self.dock_drag = None;
         self.cancel_press();
-        let (cfg, note) = Config::load();
+        let (mut cfg, note) = Config::load();
         if !note.is_empty() {
             eprintln!("[ring-dock] {note}");
         }
-        self.cfg = cfg;
+        if shortcut::retarget_config(&mut cfg) {
+            self.cfg = cfg;
+            self.save_items();
+        } else {
+            self.cfg = cfg;
+        }
         if let Err(error) = crate::autostart::apply(self.cfg.auto_start) {
             self.status = Some((format!("开机启动设置失败：{error}"), Instant::now()));
         }
@@ -1307,9 +1415,14 @@ fn main() {
     deskpin::enable_dpi_awareness();
     let (ox, oy, w, h) = deskpin::work_area();
 
-    let (cfg, note) = Config::load();
+    let (mut cfg, note) = Config::load();
     if !note.is_empty() {
         eprintln!("[ring-dock] {note}");
+    }
+    if shortcut::retarget_config(&mut cfg) {
+        if let Err(error) = cfg.save() {
+            eprintln!("[ring-dock] 快捷方式真实目标写回失败：{error}");
+        }
     }
     let preview = std::env::args().any(|arg| arg == "--preview");
     if !preview {
@@ -1374,6 +1487,7 @@ fn main() {
             press_pt: None,
             press_consumed: false,
             drag_item: None,
+            drag_origin: None,
             dock_drag: None,
             tick: 0,
             pinner: deskpin::Pinner::new(),

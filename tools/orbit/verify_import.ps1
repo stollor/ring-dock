@@ -26,14 +26,29 @@ $result=& (Join-Path $PSScriptRoot 'import_desktop.ps1') -ConfigPath $cfg -Roots
 $after=Get-Content $cfg -Raw|ConvertFrom-Json
 Assert ($result.added -eq 3 -and (Test-Path -LiteralPath $result.backup)) '原子导入与原配置备份'
 Assert ($after.quadrants[0].items[0].name -eq '保留收藏' -and $after.quadrants[0].items[1].name -eq '已存在大小写路径') '现有收藏顺序与条目保留'
-Assert ($after.quadrants[2].items[-1].kind -eq 'folder') '文件夹快捷方式分类'
-Assert ($after.quadrants[1].items[-1].kind -eq 'file') '文档快捷方式分类'
-Assert ($after.quadrants[0].items[-1].target -eq (Join-Path $nested '程序 参数.lnk')) '保存原始 .lnk 路径，不丢启动参数'
-$allSame=$true;foreach($s in $result.sources){if((Get-FileHash -LiteralPath $s.target).Hash -ne $s.sha256){$allSame=$false}};Assert $allSame '所有源快捷方式逐字节未改'
+Assert ($after.quadrants[2].items[-1].kind -eq 'folder' -and $after.quadrants[2].items[-1].target -eq $targetFolder) '文件夹快捷方式保存真实目录'
+Assert ($after.quadrants[1].items[-1].kind -eq 'file' -and $after.quadrants[1].items[-1].target -eq $targetFile) '文档快捷方式保存真实文件'
+Assert ($after.quadrants[0].items[-1].target -ieq "$env:WINDIR\System32\notepad.exe" -and $after.quadrants[0].items[-1].args -eq '/fixture-never-launched') '程序快捷方式保存真实目标和启动参数'
+Assert ($after.quadrants[0].items[1].target -eq 'https://example.invalid/never-opened') '已保存的网址快捷方式改写为真实网址'
+$allSame=$true;foreach($s in $result.sources){if((Get-FileHash -LiteralPath $s.source).Hash -ne $s.sha256){$allSame=$false}};Assert $allSame '所有源快捷方式逐字节未改'
 $again=& (Join-Path $PSScriptRoot 'import_desktop.ps1') -ConfigPath $cfg -Roots @($dir,$nested) | ConvertFrom-Json
 Assert ($again.added -eq 0 -and $again.duplicates -eq 4 -and $again.configBeforeSha256 -eq $again.configAfterSha256) '重复导入幂等，不重新写盘'
 $bad=Join-Path $out 'bad.json';Set-Content -LiteralPath $bad '{broken';$badHash=(Get-FileHash $bad).Hash;$rejected=$false
 try{& (Join-Path $PSScriptRoot 'import_desktop.ps1') -ConfigPath $bad -Roots @($dir)|Out-Null}catch{$rejected=$true}
 Assert ($rejected -and (Get-FileHash $bad).Hash -eq $badHash) '无效配置失败保护，不覆盖为默认收藏'
+# 存量配置仍是旧分类名时，来源目录映射回落到旧分类，不丢条目
+$legacy=Join-Path $out 'legacy.json'
+$legacyConfig=@{quadrant_count=4;opacity=0.85;clock_format='%H:%M';icon_size=48;item_gap=12;row_gap=16;panel_padding=16;max_columns=5;max_height_ratio=0.72;quadrants=@(
+ @{label='日常协作';kind='program';items=@()},
+ @{label='开发创作';kind='program';items=@()},
+ @{label='AI助手';kind='program';items=@()},
+ @{label='娱乐影音';kind='program';items=@()})}
+$legacyConfig|ConvertTo-Json -Depth 10|Set-Content -LiteralPath $legacy -Encoding utf8
+$legacyRoot=Join-Path $out '旧分类';$legacyTool=Join-Path $legacyRoot '工具效率';New-Item -ItemType Directory -Force $legacyTool|Out-Null
+$legacyShell=New-Object -ComObject WScript.Shell
+try{$legacyLink=$legacyShell.CreateShortcut((Join-Path $legacyTool '计算器.lnk'));$legacyLink.TargetPath="$env:WINDIR\System32\calc.exe";$legacyLink.Save()}finally{[void][Runtime.InteropServices.Marshal]::ReleaseComObject($legacyShell)}
+$legacyResult=& (Join-Path $PSScriptRoot 'import_desktop.ps1') -ConfigPath $legacy -Roots @($legacyRoot)|ConvertFrom-Json
+$legacyAfter=Get-Content $legacy -Raw|ConvertFrom-Json
+Assert ($legacyResult.added -eq 1 -and $legacyAfter.quadrants[0].items[0].name -eq '计算器') '旧分类名配置回落：新增条目落进日常协作'
 $report=if($ReportDir){Join-Path $ReportDir 'import-test-results.json'}else{Join-Path $out 'results.json'}
 [IO.File]::WriteAllText($report,(@{date=(Get-Date).ToString('o');checks=$checks.ToArray();productionConfigModified=$false}|ConvertTo-Json -Depth 8),[Text.UTF8Encoding]::new($false))
