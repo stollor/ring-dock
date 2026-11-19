@@ -1,5 +1,7 @@
 //! 矢量图标 —— 全代码绘制，无图片素材（圆头描边，风格与圆环/面板统一）
-//! 四类：program（窗口）/ file（折角文档）/ folder（文件夹）/ url（地球）
+//! 条目：program（窗口）/ file（折角文档）/ folder（文件夹）/ url（地球）
+//! 分类：collaboration（对话）/ development（代码）/ ai（星芒）/ entertainment（播放）
+//!       / design（立方体）/ system（齿轮）
 use windows::Win32::Graphics::Direct2D::Common::D2D_RECT_F;
 use windows::Win32::Graphics::Direct2D::{
     ID2D1RenderTarget, ID2D1SolidColorBrush, ID2D1StrokeStyle, D2D1_ELLIPSE, D2D1_ROUNDED_RECT,
@@ -184,6 +186,58 @@ pub fn draw_icon(
                     style,
                 );
             }
+            "design" => {
+                // 立方体：三个可见面 + 中心汇合的棱，表示建模/画面/资产。
+                let v = |x: f32, y: f32| pt(cx + x * s, cy + y * s);
+                let top = v(0.0, -1.02);
+                let right = v(0.92, -0.52);
+                let left = v(-0.92, -0.52);
+                let center = v(0.0, 0.02);
+                let bottom = v(0.0, 1.06);
+                let right_low = v(0.92, 0.56);
+                let left_low = v(-0.92, 0.56);
+                for (from, to) in [
+                    (left, top),
+                    (top, right),
+                    (right, right_low),
+                    (right_low, bottom),
+                    (bottom, left_low),
+                    (left_low, left),
+                ] {
+                    rt.DrawLine(from, to, brush, stroke, style);
+                }
+                for to in [left, right, bottom] {
+                    rt.DrawLine(center, to, brush, stroke * 0.86, style);
+                }
+            }
+            "system" => {
+                // 齿轮：外圈 + 八颗齿 + 轴心，表示系统与环境。
+                let r = s * 0.62;
+                let hub = s * 0.24;
+                let disc = D2D1_ELLIPSE {
+                    point: pt(cx, cy),
+                    radiusX: r,
+                    radiusY: r,
+                };
+                rt.DrawEllipse(&disc, brush, stroke, style);
+                let axle = D2D1_ELLIPSE {
+                    point: pt(cx, cy),
+                    radiusX: hub,
+                    radiusY: hub,
+                };
+                rt.DrawEllipse(&axle, brush, stroke * 0.9, style);
+                for index in 0..8 {
+                    let angle = std::f32::consts::FRAC_PI_4 * index as f32;
+                    let (sin, cos) = angle.sin_cos();
+                    rt.DrawLine(
+                        pt(cx + cos * r * 0.96, cy + sin * r * 0.96),
+                        pt(cx + cos * r * 1.26, cy + sin * r * 1.26),
+                        brush,
+                        stroke * 1.45,
+                        style,
+                    );
+                }
+            }
             "program" => {
                 // 窗口：圆角外框 + 标题栏线 + 两颗窗钮
                 let w = s * 1.86;
@@ -335,8 +389,42 @@ pub fn draw_icon(
     }
 }
 
+pub fn is_builtin_icon(kind: &str) -> bool {
+    matches!(
+        kind,
+        "collaboration"
+            | "development"
+            | "ai"
+            | "entertainment"
+            | "design"
+            | "system"
+            | "program"
+            | "file"
+            | "folder"
+            | "url"
+    )
+}
+
+/// 内置图形之外的值视为用户选择的图标文件。
+pub fn custom_icon_path(icon: &str) -> Option<&str> {
+    let icon = icon.trim();
+    if icon.is_empty() || icon == "auto" || is_builtin_icon(icon) {
+        None
+    } else {
+        Some(icon)
+    }
+}
+
 pub fn category_icon(label: &str) -> Option<&'static str> {
     match label {
+        // 按「产出物」划分的六维分类。
+        "写码" => Some("development"),
+        "造画面" => Some("design"),
+        "问 AI" | "问AI" => Some("ai"),
+        "沟通" => Some("collaboration"),
+        "玩与看" => Some("entertainment"),
+        "系统环境" => Some("system"),
+        // 旧分类名保留，避免存量配置失去图标。
         "日常协作" => Some("collaboration"),
         "开发创作" => Some("development"),
         "AI助手" | "AI 助手" => Some("ai"),

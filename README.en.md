@@ -53,7 +53,7 @@ Each sector opens its own category. The panel below shows the saved apps and sho
   <img src="docs/images/ai-assistant-panel.png" width="520" alt="Ring Dock panel with saved AI assistant apps" />
 </p>
 
-By default, panel items use their original Windows icons, and ring categories show icons without text. Right-click the ring to open Settings. You can enable “Start Ring Dock when I sign in to Windows” and change category display, category icons, panel icon style, clock format, opacity, and layout. Category icons can be selected individually or matched automatically for collaboration, development, AI, entertainment, apps, files, folders, and websites.
+By default, panel items use their original Windows icons, and ring categories show icons without text. Right-click the ring to open Settings. You can enable “Start Ring Dock when I sign in to Windows” and change category display, category icons, panel icon style, clock format, opacity, and layout. Category icons can be selected individually or matched automatically for collaboration, development, AI, entertainment, design, system, apps, files, folders, and websites.
 
 <p align="center">
   <img src="docs/images/settings.png" width="420" alt="Ring Dock category and icon settings" />

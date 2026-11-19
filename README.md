@@ -53,7 +53,7 @@ Invoke-WebRequest "https://raw.githubusercontent.com/$repo/$tag/tools/install/in
   <img src="docs/images/ai-assistant-panel.png" width="520" alt="Ring Dock 展开 AI 助手分类后的应用收藏面板" />
 </p>
 
-默认情况下，面板条目使用 Windows 原图标，圆环分类只显示图标、不显示文字。右键打开设置后，可以开启“登录 Windows 时自动启动 Ring Dock”，也可以修改分类图标显示方式、每个分类的图标、面板条目图标样式、时钟格式、透明度和布局。圆环图标可以自动匹配分类，也可以单独指定协作、开发、AI、娱乐、程序、文件、文件夹或网址图标。
+默认情况下，面板条目使用 Windows 原图标，圆环分类只显示图标、不显示文字。右键打开设置后，可以开启“登录 Windows 时自动启动 Ring Dock”，也可以修改分类图标显示方式、每个分类的图标、面板条目图标样式、时钟格式、透明度和布局。圆环图标可以自动匹配分类，也可以单独指定协作、开发、AI、娱乐、设计、系统、程序、文件、文件夹或网址图标。
 
 <p align="center">
   <img src="docs/images/settings.png" width="420" alt="分类与图标设置窗口" />
