@@ -1,0 +1,2 @@
+# 仓库统一以 LF 存储，避免 Windows 编辑器写入 CRLF 造成整文件伪改动。
+* text=auto eol=lf
