@@ -229,6 +229,8 @@ pub struct SceneState<'a> {
     pub expanded: Option<usize>,
     pub scroll: f32,
     pub edit_mode: bool,
+    /// 正在拖动面板里的一条收藏，可落到其他分类上。
+    pub dragging_item: bool,
     pub hover: Hit,
     pub panel_alpha: f32,
     pub drop_hot: bool,
@@ -1220,6 +1222,7 @@ impl Renderer {
             let a1 = (center + half - ARC_GAP_DEG).to_radians();
             let hot = st.hover == Hit::Quadrant(q);
             let active = st.expanded == Some(q);
+            let drop_target = st.dragging_item && hot && !active;
             let col = accent(q);
             self.arc(
                 rt,
@@ -1240,7 +1243,13 @@ impl Renderer {
                     a1,
                     g.stroke - 2.0,
                     col,
-                    if active { 0.14 } else { 0.08 },
+                    if drop_target {
+                        0.46
+                    } else if active {
+                        0.14
+                    } else {
+                        0.08
+                    },
                 );
             }
             self.arc(rt, g, g.r_disc() - 0.6, a0, a1, 0.8, WHITE, 0.16);
@@ -1896,10 +1905,13 @@ impl Renderer {
         }
         let footer = if let Some(status) = st.status {
             status.to_string()
+        } else if st.dragging_item && matches!(st.hover, Hit::Quadrant(q) if st.expanded != Some(q))
+        {
+            "松开鼠标 · 移到这个分类".into()
         } else if st.drop_hot {
             "松开鼠标 · 收纳到此分类".into()
         } else if st.edit_mode {
-            "点条目可移到其他分类 · 拖动排序 · 点 − 删除".into()
+            "拖到其他分类 · 拖动排序 · 点 − 删除".into()
         } else {
             format!("{} 个收藏 · 中键拖动位置", q.items.len())
         };

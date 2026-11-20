@@ -12,6 +12,7 @@ mod open;
 mod placement;
 mod render;
 mod settings_ui;
+mod shell_menu;
 mod shortcut;
 mod sys;
 mod tray;
@@ -263,6 +264,7 @@ impl App {
             expanded: self.expanded,
             scroll: self.scroll,
             edit_mode: self.edit_mode,
+            dragging_item: self.drag_item.is_some(),
             hover: self.hover,
             panel_alpha: self.panel_alpha,
             drop_hot: self.drop_hot,
@@ -475,22 +477,11 @@ impl App {
             SetTimer(Some(self.hwnd), TIMER_HOLD, HOLD_MS, None);
             let _ = SetCapture(self.hwnd);
         }
-        if self.edit_mode {
-            // 只有按在条目本体上才开始拖动；删除角标由抬起时的点击处理
-            if let hit::Hit::Item { index, .. } = hit::hit_test(
-                &self.cfg,
-                &self.geom,
-                self.screen_w,
-                self.screen_h,
-                self.expanded,
-                self.scroll,
-                self.edit_mode,
-                x,
-                y,
-            ) {
-                self.drag_item = Some(index);
-                self.drag_origin = Some(index);
-            }
+        // 按在条目上即可拖动。整理态里拖动会排序；拖到其他分类上则直接移入。
+        // 删除角标不开始拖动，留给抬起时的点击。
+        if let hit::Hit::Item { index, .. } = self.hit_at(x, y) {
+            self.drag_item = Some(index);
+            self.drag_origin = Some(index);
         }
     }
 
@@ -541,14 +532,29 @@ impl App {
             self.hover = h;
             self.redraw();
         }
-        if let (Some(index), Some(qi)) = (self.drag_item, self.expanded) {
-            if let Some(to) = self.cell_at(x, y) {
-                if to != index && self.cfg.move_item(qi, index, to) {
-                    self.drag_item = Some(to);
-                    self.refresh_panel();
+        // 只有整理态才在面板内换位。普通拖动穿过其他图标时不能把它们挤开。
+        if self.edit_mode {
+            if let (Some(index), Some(qi)) = (self.drag_item, self.expanded) {
+                if let Some(to) = self.cell_at(x, y) {
+                    if to != index && self.cfg.move_item(qi, index, to) {
+                        self.drag_item = Some(to);
+                        self.refresh_panel();
+                    }
                 }
             }
         }
+    }
+
+    /// 拖到另一个分类的圆环上时，把当前条目移过去。返回目标分类。
+    fn relocate_to_category(&mut self, index: usize, x: f32, y: f32) -> Option<usize> {
+        let from = self.expanded?;
+        let hit::Hit::Quadrant(to) = self.hit_at(x, y) else {
+            return None;
+        };
+        if to == from {
+            return None;
+        }
+        self.cfg.move_item_across(from, index, to).then_some(to)
     }
     fn on_mouse_up(&mut self, x: f32, y: f32) {
         crate::drop::dlog(&format!(
@@ -566,6 +572,20 @@ impl App {
         unsafe {
             let _ = KillTimer(Some(self.hwnd), TIMER_HOLD);
             let _ = ReleaseCapture();
+        }
+        let keep_edit = self.edit_mode;
+        if let Some(index) = ended {
+            if let Some(to) = self.relocate_to_category(index, x, y) {
+                self.save_items();
+                self.set_expanded(Some(to));
+                if keep_edit {
+                    self.edit_mode = true;
+                    self.sync_title();
+                    self.redraw();
+                }
+                self.press_consumed = false;
+                return;
+            }
         }
         if reordered {
             self.save_items();
@@ -599,6 +619,65 @@ impl App {
             self.redraw();
         }
     }
+    /// 右键图标：资源管理器同款外壳菜单。空白处仍是圆环自己的菜单。
+    fn on_right_click(&mut self, x: f32, y: f32) {
+        let reordered = matches!(
+            (self.drag_item, self.drag_origin),
+            (Some(now), Some(start)) if now != start
+        );
+        let item = match self.hit_at(x, y) {
+            hit::Hit::Item { qi, index } | hit::Hit::ItemDelete { qi, index } => self
+                .cfg
+                .quadrants
+                .get(qi)
+                .and_then(|quadrant| quadrant.items.get(index))
+                .map(|item| (qi, index, item.target.clone())),
+            _ => None,
+        };
+        self.cancel_press();
+        if reordered {
+            self.save_items();
+        }
+        if let Some((qi, index, target)) = item {
+            if shell_menu::show(&target) == shell_menu::Choice::Open {
+                self.open_item(qi, index);
+            }
+            return;
+        }
+        self.popup_menu();
+    }
+
+    fn open_item(&mut self, qi: usize, index: usize) {
+        let Some(mut item) = self
+            .cfg
+            .quadrants
+            .get(qi)
+            .and_then(|quadrant| quadrant.items.get(index))
+            .cloned()
+        else {
+            return;
+        };
+        if shortcut::materialize_item(&mut item) {
+            if let Some(stored) = self
+                .cfg
+                .quadrants
+                .get_mut(qi)
+                .and_then(|quadrant| quadrant.items.get_mut(index))
+            {
+                *stored = item.clone();
+            }
+            self.save_items();
+        }
+        if let Err(error) = open::launch(&item.target, &item.args, &item.workdir) {
+            self.status = Some((error, Instant::now()));
+            self.redraw();
+            return;
+        }
+        if self.cfg.auto_collapse_after_open {
+            self.set_expanded(None);
+        }
+    }
+
     /// 点击：命中测试与绘制严格一致（hit.rs，带单测），杜绝跨区域误触发
     fn on_click(&mut self, x: f32, y: f32) {
         let hit = hit::hit_test(
@@ -615,37 +694,10 @@ impl App {
         match hit {
             // 面板图标：打开条目（打开后是否自动收起走设置）
             hit::Hit::Item { qi, index } => {
-                let item = self
-                    .cfg
-                    .quadrants
-                    .get(qi)
-                    .and_then(|q| q.items.get(index))
-                    .cloned();
-                if let Some(item) = item {
-                    if self.edit_mode {
-                        return;
-                    }
-                    let mut item = item;
-                    if shortcut::materialize_item(&mut item) {
-                        if let Some(stored) = self
-                            .cfg
-                            .quadrants
-                            .get_mut(qi)
-                            .and_then(|q| q.items.get_mut(index))
-                        {
-                            *stored = item.clone();
-                        }
-                        self.save_items();
-                    }
-                    if let Err(e) = open::launch(&item.target, &item.args, &item.workdir) {
-                        self.status = Some((e, Instant::now()));
-                        self.redraw();
-                        return;
-                    }
-                    if self.cfg.auto_collapse_after_open {
-                        self.set_expanded(None);
-                    }
+                if self.edit_mode {
+                    return;
                 }
+                self.open_item(qi, index);
             }
             // 弧段：展开 / 收起 / 切换（切换行为走设置）
             hit::Hit::Quadrant(qi) => match self.expanded {
@@ -1128,7 +1180,9 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
         }
         WM_RBUTTONUP => {
             if !ptr.is_null() && (*ptr).dock_drag.is_none() {
-                (*ptr).popup_menu();
+                let x = (l.0 & 0xFFFF) as i16 as f32 + (*ptr).renderer.offset.0 as f32;
+                let y = ((l.0 >> 16) & 0xFFFF) as i16 as f32 + (*ptr).renderer.offset.1 as f32;
+                (*ptr).on_right_click(x, y);
             }
             LRESULT(0)
         }
